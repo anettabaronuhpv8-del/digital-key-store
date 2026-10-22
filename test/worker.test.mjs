@@ -131,3 +131,12 @@ test('owner trial status and Live charge panel remain private and disabled witho
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
 });
+
+test('owner recovery cannot deliver or charge an unpaid trial',async()=>{
+ const e=env();const cookie=await setup(e,{items:{'package-1':1}});
+ assert.equal((await go(e,'/api/admin/live-test/recover','POST',{})).status,403);
+ const response=await result(await go(e,'/api/admin/live-test/recover','POST',{},undefined,cookie));
+ assert.equal(response.status,404);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
+});
