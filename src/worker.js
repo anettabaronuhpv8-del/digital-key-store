@@ -355,7 +355,15 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  let facilitator;
  try{facilitator=createNevermined({NVM_API_KEY:await sellerKey(env),NVM_ENV:config.environment});}catch{await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='NOT_CONFIGURED' WHERE id=?",attempt.id).run();await releasePublicSlot();return fail('Payment provider is not configured',503);}
  let verify;
- try{verify=await facilitator.verify(d.token,paymentRequired,credits);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await haltCheckout(env,id,'VERIFY_UNCERTAIN');return fail('Payment verification uncertain. Do not retry this order; contact the store owner.',503);}
+ try{verify=await facilitator.verify(d.token,paymentRequired,credits);}catch(err){
+  // Verification never calls settlement. A rejected token must not stop every buyer.
+  const code=safeError(err);
+  await release(env,id);
+  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code=? WHERE id=? AND status='verifying'",code,attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=? AND status='verifying'",id)]);
+  await releasePublicSlot();
+  await audit(env,'payment_verification_failed',id,code);
+  return json({error:'Payment verification failed ('+code+'). No settlement was attempted for this order. Check your Nevermined token and selected package.',charged:false,settlementAttempted:false,providerCode:code},err.http>=400&&err.http<500?402:502);
+ }
  if(!isVerified(verify)){await release(env,id);await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='VERIFY_REJECTED' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);await releasePublicSlot();return fail('Token verification was rejected; no key was delivered.',402);}
  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='settling' WHERE id=? AND status='verifying'",attempt.id),q(env,"UPDATE orders SET status='settling' WHERE id=?",id)]);
  let settled;
