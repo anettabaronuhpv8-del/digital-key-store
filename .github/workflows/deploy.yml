@@ -16,8 +16,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install locked dependencies
-        run: npm ci
+      - name: Install Wrangler dependencies
+        run: npm install --no-audit --no-fund
       - name: Run complete test suite
         run: npm test
       - name: Validate Worker modules
