@@ -174,8 +174,28 @@ async function fulfill(env,id){
  return decrypt(await aes(env.INVENTORY_SECRET),d.key_ciphertext);
 }
 async function statusOrder(req,env,id){const order=await orderSecret(req,env,id);if(!order)return fail('Not found',404);let key=null;if(order.status==='settled'||order.status==='delivered')key=await fulfill(env,id);const fresh=await q(env,'SELECT status FROM orders WHERE id=?',id).first();return json({orderId:id,status:fresh?.status||order.status,key});}
-async function chargeOrder(req,env,id){
- if(env.CHECKOUT_ENABLED!=='true')return fail('Checkout is not enabled',503);
+// Locked owner-only single-use live trial. This route is unreachable to buyers.
+// It requires a separate deployment-time explicit approval gate; default is OFF.
+async function chargeFirstOwnerTrial(req,env){
+ if(env.CHECKOUT_ENABLED==='true'||env.OWNER_LIVE_TEST_APPROVED!=='true')return fail('Owner Live test is not authorized',403);
+ const id=await getSetting(env,'owner_first_live_test_order_id');
+ if(!id)return fail('Owner test order is not prepared',409);
+ const o=await q(env,'SELECT status,total_cents,currency FROM orders WHERE id=?',id).first();
+ const a=await q(env,'SELECT status,credits_requested,product_id FROM payment_attempts WHERE order_id=?',id).first();
+ if(!o||o.status!=='pending'||o.total_cents!==100||o.currency!=='USD'||!a||a.status!=='created'||a.product_id!=='package-1'||Number(a.credits_requested)!==1)return fail('Owner test order is not eligible for a first charge',409);
+ const d=await readJSON(req,10000);
+ if(d.confirm!==('CHARGE $1 '+id)||typeof d.token!=='string'||d.token.length<8||d.token.length>8000)return fail('Explicit $1 order confirmation and token required',400);
+ // One-use gate is written BEFORE verification/settlement. Fail closed if interrupted.
+ const claim=await q(env,"INSERT OR IGNORE INTO settings(key,value) VALUES('owner_first_live_test_claimed',?)",id).run();
+ if(claim.meta.changes!==1)return fail('Owner test has already been claimed; never retry automatically',409);
+ const headers=new Headers(req.headers);
+ headers.set('Authorization','Bearer '+await mac(env.SESSION_SECRET,'owner-first-live-test:'+id));
+ headers.set('Content-Type','application/json');
+ const internal=new Request(own(req)+'/api/orders/'+id+'/charge',{method:'POST',headers,body:JSON.stringify({token:d.token})});
+ return chargeOrder(internal,env,id,true);
+}
+async function chargeOrder(req,env,id,ownerTrial=false){
+ if(env.CHECKOUT_ENABLED!=='true'&&!ownerTrial)return fail('Checkout is not enabled',503);
  const order=await orderSecret(req,env,id);if(!order)return fail('Not found',404);
  if(['settled','delivered'].includes(order.status))return statusOrder(req,env,id);
  const attempt=await q(env,'SELECT * FROM payment_attempts WHERE order_id=?',id).first();
@@ -254,6 +274,7 @@ export default {async fetch(req,env){
    if(req.method==='GET'&&path==='/api/admin/dashboard')return dashboard(env);
    if(req.method==='POST'&&path==='/api/admin/live-test/prepare')return prepareFirstOwnerTest(req,env);
    if(req.method==='POST'&&path==='/api/admin/live-test/verify-token')return verifyFirstOwnerToken(req,env);
+   if(req.method==='POST'&&path==='/api/admin/live-test/charge-once')return chargeFirstOwnerTrial(req,env);
    if(req.method==='POST'&&path==='/api/admin/nevermined/verify')return json(await verifyNeverminedConnection(env));
    if(req.method==='PUT'&&path==='/api/admin/config')return saveConfig(req,env);if(req.method==='PUT'&&path==='/api/admin/password')return changePassword(req,env);
    if(req.method==='POST'&&path==='/api/admin/products')return createProduct(req,env);
