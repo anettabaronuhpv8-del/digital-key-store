@@ -71,6 +71,44 @@ async function verifyNeverminedConnection(env,fetcher=fetch){
 }
 async function changePassword(req,env){const d=await readJSON(req,5000);if(!await passwordOK(env,d.currentPassword))return fail('Current password incorrect',403);if(typeof d.newPassword!=='string'||d.newPassword.length<20||d.newPassword.length>128)return fail('New password must be 20 to 128 characters',400);const changed=await mac(env.SESSION_SECRET,'admin-password:'+d.newPassword);const epoch=String(Number(await getSetting(env,'admin_session_epoch','1'))+1);await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_password_digest',changed),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_session_epoch',epoch)]);await audit(env,'admin_password_rotated');return json({ok:true},200,{'Set-Cookie':cookie('',0)});}
 async function orderSecret(req,env,id){const bearer=req.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];if(!bearer||bearer.length>300)return null;const order=await q(env,'SELECT * FROM orders WHERE id=?',id).first();return order&&equal(order.access_token_hash,await sha(bearer))?order:null;}
+// Admin-only preparation. Creates no charge, performs no verification/settlement,
+// and does not unlock the public checkout. One immutable pending trial at most.
+async function prepareFirstOwnerTest(req,env){
+ if(env.CHECKOUT_ENABLED==='true')return fail('Owner test requires locked public checkout',409);
+ const config=await paymentConfig(env);
+ if(config.environment!=='live'||config.scheme!=='nvm:card-delegation'||config.network!=='stripe')
+  return fail('First trial requires Live Stripe card delegation configuration',409);
+ if(!await sellerKey(env)||!config.agentId)return fail('Nevermined not configured',409);
+ const p=await q(env,"SELECT p.id,p.price_cents,p.currency,pl.plan_id,pl.credits_per_purchase,pl.enabled FROM products p JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.id='package-1' AND p.active=1 AND p.deleted_at IS NULL").first();
+ if(!p||!p.enabled||!p.plan_id||p.plan_id==='not-configured'||p.price_cents!==100||p.currency!=='USD'||Number(p.credits_per_purchase)!==1)
+  return fail('Package 1 must be $1 USD / 1 PAYG redemption unit',409);
+ const count=await q(env,"SELECT COUNT(*) AS n FROM inventory WHERE product_id=? AND status='available'",p.id).first();
+ if(!count||Number(count.n)<1)return fail('Package 1 is out of stock',409);
+ const existing=await getSetting(env,'owner_first_live_test_order_id');
+ let orderId=existing;
+ if(!orderId){
+  const id='dks_'+crypto.randomUUID();
+  const orderAccess=await mac(env.SESSION_SECRET,'owner-first-live-test:'+id);
+  const itemId='item_'+crypto.randomUUID();
+  const attemptId='attempt_'+crypto.randomUUID();
+  try{
+   await env.DB.batch([
+    q(env,"INSERT INTO settings(key,value) VALUES('owner_first_live_test_order_id',?)",id),
+    q(env,'INSERT INTO orders(id,status,currency,total_cents,access_token_hash) VALUES(?,?,?,?,?)',id,'pending','USD',100,await sha(orderAccess)),
+    q(env,'INSERT INTO order_items(id,order_id,product_id,quantity,unit_price_cents,subtotal_cents) VALUES(?,?,?,1,100,100)',itemId,id,p.id),
+    q(env,'INSERT INTO payment_attempts(id,order_id,product_id,plan_id,request_id,status,credits_requested) VALUES(?,?,?,?,?,?,1)',attemptId,id,p.id,p.plan_id,id,'created')
+   ]);
+   orderId=id;
+  }catch{
+   orderId=await getSetting(env,'owner_first_live_test_order_id');
+   if(!orderId)return fail('Unable to prepare trial order',503);
+  }
+ }
+ const order=await q(env,'SELECT status,total_cents,currency FROM orders WHERE id=?',orderId).first();
+ if(!order||order.total_cents!==100||order.currency!=='USD')return fail('Prepared order is invalid',409);
+ const paymentRequired=buildPaymentRequiredForOrder({planId:p.plan_id,agentId:config.agentId,scheme:config.scheme,network:config.network,resourceUrl:own(req)+'/api/orders/'+orderId+'/charge'});
+ return json({orderId,status:order.status,productId:'package-1',quantity:1,priceCents:100,currency:'USD',redemptionUnits:1,planId:p.plan_id,checkoutEnabled:false,chargeAuthorized:false,notCharged:true,paymentRequired,deliveryToken:await mac(env.SESSION_SECRET,'owner-first-live-test:'+orderId)});
+}
 async function startOrder(req,env){
  if(env.CHECKOUT_ENABLED!=='true'||!await configured(env))return fail('Checkout is not enabled',503);
  const d=await readJSON(req,1000);if(!productId(d.productId)||(d.quantity!==undefined&&d.quantity!==1))return fail('Only one key can be purchased');
@@ -196,6 +234,7 @@ export default {async fetch(req,env){
    if(!await isAdmin(req,env))return fail('Owner authentication required',403);
    if(req.method==='POST'&&path==='/api/admin/logout')return json({ok:true},200,{'Set-Cookie':cookie('',0)});
    if(req.method==='GET'&&path==='/api/admin/dashboard')return dashboard(env);
+   if(req.method==='POST'&&path==='/api/admin/live-test/prepare')return prepareFirstOwnerTest(req,env);
    if(req.method==='POST'&&path==='/api/admin/nevermined/verify')return json(await verifyNeverminedConnection(env));
    if(req.method==='PUT'&&path==='/api/admin/config')return saveConfig(req,env);if(req.method==='PUT'&&path==='/api/admin/password')return changePassword(req,env);
    if(req.method==='POST'&&path==='/api/admin/products')return createProduct(req,env);
