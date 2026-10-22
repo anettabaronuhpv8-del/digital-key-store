@@ -18,3 +18,12 @@ test('owner diagnostics show plan owner and memberships without claiming settlem
  globalThis.fetch=async(url,opt)=>{calls.push({url,method:opt.method});if(url.endsWith('/organizations/my-memberships'))return Response.json([{orgId:'org-test',orgName:'Test Store',role:'Admin',secret:'not-exposed'}]);if(url.includes('/agents/'))return Response.json({plans:[{planId:'plan-synthetic'}]});return Response.json({planId:'plan-synthetic',owner:'owner-test',secret:'not-exposed',creditsConfig:{amount:1}});};
  try{const r=await worker.fetch(req('/api/admin/nevermined/verify','POST',{},cookie),e);const d=await r.json();assert.equal(d.ownershipVerified,false);assert.equal(d.plans.find(p=>p.productId==='package-1').planOwner,'owner-test');assert.deepEqual(d.memberships,[{orgId:'org-test',orgName:'Test Store',role:'Admin'}]);assert.ok(calls.every(c=>c.method==='GET'));assert.doesNotMatch(JSON.stringify(d),/not-exposed|synthetic-only/);}finally{globalThis.fetch=original;}
 });
+
+test('caller-owned listing distinguishes seller access from readable Plan metadata',async()=>{
+ const e=env(),cookie=await setup(e),original=globalThis.fetch;
+ globalThis.fetch=async(url,opt)=>{assert.equal(opt.method,'GET');if(url.includes('/protocol/plans?'))return Response.json({total:1,plans:[{id:'plan-synthetic'}]});if(url.endsWith('/organizations/my-memberships'))return Response.json([]);if(url.includes('/agents/'))return Response.json({plans:[{planId:'plan-synthetic'}]});return Response.json({id:'plan-synthetic',creditsConfig:{amount:1}});};
+ try{const d=await(await worker.fetch(req('/api/admin/nevermined/verify','POST',{},cookie),e)).json();assert.equal(d.sellerListingComplete,true);assert.equal(d.sellerListingError,null);assert.equal(d.plans.find(p=>p.productId==='package-1').listedInSellerAccount,true);assert.equal(d.ownershipVerified,false);
+ const base=globalThis.fetch;globalThis.fetch=async(url,opt)=>url.includes('/protocol/plans?')?Response.json({total:0,plans:[]}):base(url,opt);
+ const missing=await(await worker.fetch(req('/api/admin/nevermined/verify','POST',{},cookie),e)).json();assert.equal(missing.plans.find(p=>p.productId==='package-1').listedInSellerAccount,false);
+ }finally{globalThis.fetch=original;}
+});
