@@ -1,0 +1,13 @@
+name = "digital-key-store"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+CHECKOUT_ENABLED = "false"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "digital-key-store-db"
+database_id = "1296d184-6168-49a1-9311-7df37499818e"
+migrations_dir = "migrations"
