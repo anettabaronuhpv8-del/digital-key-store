@@ -34,6 +34,22 @@ async function neverminedOriginProbe(fetcher=fetch){
  try{const r=await fetcher(url,{method:'GET',headers:{Accept:'application/json'},signal:AbortSignal.timeout(8000),redirect:'manual'});return {ok:true,httpStatus:r.status,category:r.status===401?'UNAUTHORIZED_EXPECTED':r.status===403?'FORBIDDEN':r.status===404?'NOT_FOUND':'HTTP_RESPONSE',host:'api.live.nevermined.app',path:'/api/v1/protocol/agents'};}
  catch(e){const name=String(e?.name||'Error');const causeName=String(e?.cause?.name||'');const category=name==='TimeoutError'||name==='AbortError'?'TIMEOUT':name==='TypeError'?'FETCH_TYPE_ERROR':'FETCH_EXCEPTION';return {ok:false,httpStatus:null,category,errorName:['TypeError','AbortError','TimeoutError','Error'].includes(name)?name:'OTHER',causeCategory:causeName==='Error'?'GENERIC_CAUSE':causeName==='TypeError'?'TYPE_CAUSE':'UNKNOWN_CAUSE',host:'api.live.nevermined.app',path:'/api/v1/protocol/agents'};}
 }
+// One-shot authenticated GET probe; fixed endpoint, no response body or secret disclosure.
+async function neverminedAuthProbeOnce(env,fetcher=fetch){
+ const keyName='nvm_auth_probe_once_20261022';
+ const previous=await getSetting(env,keyName);
+ if(previous)return JSON.parse(previous);
+ const lock=await q(env,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',keyName,JSON.stringify({ok:false,category:'IN_PROGRESS'})).run();
+ if(lock.meta.changes!==1)return {ok:false,category:'ALREADY_RUNNING'};
+ const config=await paymentConfig(env),key=await sellerKey(env);
+ let out={ok:false,category:'MISSING_CONFIGURATION'};
+ if(config.environment==='live'&&key&&config.agentId){
+  const url='https://api.live.nevermined.app/api/v1/protocol/agents/'+encodeURIComponent(config.agentId);
+  try{const response=await fetcher(url,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(10000)});out={ok:true,httpStatus:response.status,category:response.status>=300&&response.status<400?'REDIRECT':response.status===401?'UNAUTHORIZED':response.status===403?'FORBIDDEN':response.status===404?'NOT_FOUND':response.ok?'HTTP_SUCCESS':'HTTP_ERROR'};}
+  catch(e){const name=String(e?.name||'');out={ok:false,httpStatus:null,category:name==='TimeoutError'||name==='AbortError'?'TIMEOUT':name==='TypeError'?'FETCH_TYPE_ERROR':'FETCH_EXCEPTION',errorName:['TypeError','Error','TimeoutError','AbortError'].includes(name)?name:'OTHER'};}
+ }
+ await setSetting(env,keyName,JSON.stringify(out));return out;
+}
 async function verifyNeverminedConnection(env,fetcher=fetch){
  const config=await paymentConfig(env);
  const key=await sellerKey(env);
@@ -164,6 +180,7 @@ export default {async fetch(req,env){
   if(req.method==='GET'&&path==='/')return page(storefront());
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
   if(req.method==='GET'&&path==='/api/health/nevermined-origin')return json(await neverminedOriginProbe());
+  if(req.method==='GET'&&path==='/api/health/nevermined-auth-once')return json(await neverminedAuthProbeOnce(env));
   if(req.method==='GET'&&path==='/api/products')return catalog(env);
   if(req.method==='POST'&&path==='/api/orders')return startOrder(req,env);
   const m=idFrom(path,/^\/api\/orders\/(dks_[a-f0-9-]{36})$/);
