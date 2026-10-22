@@ -1,5 +1,4 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {settlementAccepted,classifyPaymentError} from '../src/x402.js';
-test('rejects empty settlement',()=>assert.equal(settlementAccepted(null),false));
-test('rejects verification-only result',()=>assert.equal(settlementAccepted({success:true}),false));
-test('accepts explicit settlement result shape',()=>assert.equal(settlementAccepted({success:true,creditsBurned:1}),true));
-test('sanitizes unknown payment errors',()=>assert.equal(classifyPaymentError({code:'secret'}),'PAYMENT_UNCERTAIN'));
+import test from 'node:test';import assert from 'node:assert/strict';import {createNevermined,safeError} from '../src/x402.js';
+test('official REST verify and settle contracts',async()=>{const calls=[];const mock=async(u,opt)=>{calls.push([u,JSON.parse(opt.body)]);return Response.json(u.endsWith('verify')?{valid:true,permissionHash:'permit'}:{success:true,permissionHash:'permit',creditsSettled:1,txHash:'tx-abcdefghijkl'});};const api=createNevermined({NVM_API_KEY:'sandbox:test',NVM_ENV:'sandbox'},mock);await api.verify('buyer-token','agent-id',1);await api.settle('buyer-token','agent-id',1,'order-a');assert.equal(calls[0][1].creditsRequested,1);assert.equal(calls[1][1].creditsUsed,1);assert.equal(calls[1][1].requestMetadata.orderId,'order-a');});
+test('facilitator never logs or exposes customer token in errors',async()=>{const api=createNevermined({NVM_API_KEY:'sandbox:test',NVM_ENV:'sandbox'},async()=>Response.json({code:'BCK.X402.0049',secret:'dont-return'},{status:400}));await assert.rejects(api.settle('secret-token','agent',1,'order'),e=>e.code==='BCK.X402.0049'&&!e.message.includes('secret'));});
+test('sanitize unknown payment errors',()=>assert.equal(safeError({message:'secret'}),'PAYMENT_UNCERTAIN'));
