@@ -1,5 +1,6 @@
 import {json,fail,token,sha,mac,aes,encrypt,decrypt,equal,parseTXT,cents,productId,receiptValid,decodeTokenScope,secureHeaders} from './core.js';
 import {createNevermined,safeError} from './x402.js';
+import {buildPaymentRequiredForOrder,isVerified,settlementEvidence} from './payment-contract.js';
 import {storefront,adminLogin,adminDashboard} from './ui.js';
 const q=(env,sql,...params)=>env.DB.prepare(sql).bind(...params);
 const own=(r)=>new URL(r.url).origin;
@@ -134,26 +135,40 @@ async function chargeOrder(req,env,id){
  }
  const plan=await q(env,'SELECT credits_per_purchase FROM product_payment_plans WHERE product_id=? AND enabled=1 AND plan_id=?',attempt.product_id,attempt.plan_id).first();
  if(!plan||Number(plan.credits_per_purchase)!==Number(attempt.credits_requested)){await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='PLAN_CHANGED' WHERE id=?",attempt.id).run();return fail('Payment Plan changed. No charge attempted.',409);}
- const credits=Number(attempt.credits_requested);let facilitator;
+ const credits=Number(attempt.credits_requested);
+ const paymentRequired=buildPaymentRequiredForOrder({planId:attempt.plan_id,agentId:config.agentId,scheme:config.scheme,network:config.network,resourceUrl:own(req)+'/api/orders/'+id+'/charge'});
+ let facilitator;
  try{facilitator=createNevermined({NVM_API_KEY:await sellerKey(env),NVM_ENV:config.environment});}catch{await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='NOT_CONFIGURED' WHERE id=?",attempt.id).run();return fail('Payment provider is not configured',503);}
  let verify;
- try{verify=await facilitator.verify(d.token,config.agentId,credits);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();return fail('Payment verification uncertain. Do not retry this order; contact the store owner.',503);}
- if(verify?.valid!==true){await release(env,id);await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='VERIFY_REJECTED' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);return fail('Token verification was rejected; no key was delivered.',402);}
+ try{verify=await facilitator.verify(d.token,paymentRequired,credits);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();return fail('Payment verification uncertain. Do not retry this order; contact the store owner.',503);}
+ if(!isVerified(verify)){await release(env,id);await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='VERIFY_REJECTED' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);return fail('Token verification was rejected; no key was delivered.',402);}
  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='settling' WHERE id=? AND status='verifying'",attempt.id),q(env,"UPDATE orders SET status='settling' WHERE id=?",id)]);
  let settled;
- try{settled=await facilitator.settle(d.token,config.agentId,credits,id);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await audit(env,'payment_uncertain',id,safeError(err));return fail('Payment result is uncertain. Do not retry this order; contact the store owner.',503);}
- if(!receiptValid(settled,credits)){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code='INVALID_RECEIPT' WHERE id=?",attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();return fail('Settlement result cannot be confirmed. No key delivered.',503);}
- // Only sanitized receipt fields, NEVER the buyer bearer credential.
- const evidence=JSON.stringify({txHash:settled.txHash,permissionHash:settled.permissionHash,creditsSettled:settled.creditsSettled,orderId:id,planId:attempt.plan_id});
+ try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequest?.agentRequestId);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await audit(env,'payment_uncertain',id,safeError(err));return fail('Payment result is uncertain. Do not retry this order; contact the store owner.',503);}
+ const paymentEvidence=settlementEvidence(settled,credits,order.total_cents);
+ if(!paymentEvidence?.amountVerified){
+  // Never assume a PAYG redemption unit equals USD. A facilitator response
+  // can indicate successful settlement without proving the actual fiat charge.
+  // Hold this order for reconciliation, without charging or delivering again.
+  const reason=paymentEvidence?'AMOUNT_NOT_VERIFIED':'SETTLEMENT_UNCONFIRMED';
+  const sanitized=paymentEvidence?JSON.stringify({providerTransactionId:paymentEvidence.providerTransactionId,billingModel:'pay-as-you-go',amountVerified:false,orderId:id,planId:attempt.plan_id}):null;
+  await env.DB.batch([
+   q(env,"UPDATE payment_attempts SET status='uncertain',error_code=?,receipt_json=? WHERE id=? AND status='settling'",reason,sanitized,attempt.id),
+   q(env,"UPDATE orders SET status='uncertain' WHERE id=? AND status='settling'",id)
+  ]);
+  await audit(env,'payment_reconciliation_required',id,reason);
+  return fail('Payment result requires independent reconciliation. Do not pay this order again or create a replacement order yet.',503);
+ }
+ const evidence=JSON.stringify({providerTransactionId:paymentEvidence.providerTransactionId,billingModel:'pay-as-you-go',confirmedUsdCents:paymentEvidence.confirmedUsdCents,currency:'USD',orderId:id,planId:attempt.plan_id});
  try{await env.DB.batch([
-  q(env,'INSERT INTO payments(id,order_id,provider,provider_payment_id,amount_cents,currency,status,evidence_json) VALUES(?,?,?,?,?,?,?,?)','payment_'+id,id,'nevermined',settled.txHash,order.total_cents,order.currency,'settled',evidence),
+  q(env,'INSERT INTO payments(id,order_id,provider,provider_payment_id,amount_cents,currency,status,evidence_json) VALUES(?,?,?,?,?,?,?,?)','payment_'+id,id,'nevermined',paymentEvidence.providerTransactionId,order.total_cents,order.currency,'settled',evidence),
   q(env,"UPDATE payment_attempts SET status='settled',receipt_json=?,error_code=NULL WHERE id=? AND status='settling'",evidence,attempt.id),
   q(env,"UPDATE orders SET status='settled' WHERE id=? AND status='settling'",id)
  ]);}catch{
   try{await q(env,"UPDATE payment_attempts SET status='uncertain',error_code='PERSISTENCE_UNCERTAIN' WHERE id=? AND status='settling'",attempt.id).run();}catch{}
   return fail('Payment may have settled. Please use your original order access to recover delivery. Do not pay again.',503);
  }
- await audit(env,'payment_settled',id,JSON.stringify({payment: settled.txHash,credits}));
+ await audit(env,'payment_settled',id,JSON.stringify({payment: paymentEvidence.providerTransactionId,credits}));
  const key=await fulfill(env,id);if(!key)return json({status:'settled',orderId:id,message:'Payment confirmed. Delivery pending; use the same order to recover.'},202);
  return json({status:'delivered',orderId:id,key});
 }
