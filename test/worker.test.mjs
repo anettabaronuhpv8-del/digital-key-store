@@ -137,3 +137,5 @@ test('owner recovery cannot deliver or charge an unpaid trial',async()=>{
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
 });
+
+test('buyer retains existing in-memory payment token during repeat purchase',async()=>{const e=env();const page=await (await go(e,'/')).text();assert.ok(page.includes('const previous=picked?.id'));assert.ok(page.includes('openCheckout(previous)'));assert.ok(!page.includes('localStorage.setItem'));});
