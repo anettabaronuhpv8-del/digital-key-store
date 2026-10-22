@@ -66,6 +66,14 @@ jobs:
             if(!r.ok)throw Error("Plan diagnostic HTTP "+r.status);
             console.log("Sanitized Nevermined Live plans:",JSON.stringify(await r.json()));
           '
+      - name: One-shot Nevermined plan response shape (field names only)
+        run: |
+          node --input-type=module -e '
+            const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/nevermined-plan-shape-once";
+            const r=await fetch(u,{signal:AbortSignal.timeout(20000)});
+            if(!r.ok)throw Error("Shape diagnostic HTTP "+r.status);
+            console.log("Nevermined response field shape:",JSON.stringify(await r.json()));
+          '
       - name: Verify public health and checkout lock
         run: |
           node --input-type=module -e '
