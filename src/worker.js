@@ -1,6 +1,6 @@
 import {json,fail,token,sha,mac,aes,encrypt,decrypt,equal,parseTXT,cents,productId,receiptValid,decodeTokenScope,secureHeaders} from './core.js';
 import {createNevermined,safeError} from './x402.js';
-import {buildPaymentRequiredForOrder,isVerified,settlementEvidence} from './payment-contract.js';
+import {buildPaymentRequiredForOrder,isVerified,settlementEvidence,validatePaygFiatPlan} from './payment-contract.js';
 import {storefront,adminLogin,adminDashboard,buyerTrialPage} from './ui.js';
 const q=(env,sql,...params)=>env.DB.prepare(sql).bind(...params);
 const own=(r)=>new URL(r.url).origin;
@@ -100,27 +100,6 @@ async function verifyNeverminedConnection(env,fetcher=fetch){
   plans.push({productId:p.id,ok:planIdMatches&&linked===true,planIdMatches,linkedToAgent:linked,expectedUsdCents:p.price_cents,currency:p.currency,creditsPerRequest:p.credits_per_purchase,planCreditAmount:reportedCredits,creditsMatch,creditUnitType:isPayg?'PAYG_PER_REQUEST':'CREDITS',currencyVerified,priceType:typeof price.priceType==='string'?price.priceType:typeof b.billingModel==='string'?b.billingModel:null,providerSchema:b.metadata&&b.registry?'LEGACY_REGISTRY':'API_REFERENCE',fiatUsdPriceVerified:false,networkVerified,schemeVerified,priceVerification:isPayg?'STRIPE_PRICE_ID_REQUIRES_STRIPE_PRICE_LOOKUP':'UNVERIFIED_PROVIDER_METADATA'});
  }
  return {ok:agentResponse.ok&&plans.every(p=>p.ok),keyPrefixCategory:keyEnvironment,keyEnvironmentMismatch:(keyEnvironment==='live'||keyEnvironment==='sandbox')&&keyEnvironment!==config.environment,environment:config.environment,schemeConfigured:config.scheme,networkConfigured:config.network,agentReachable:agentResponse.ok,agentError:agentResponse.ok?null:agentResponse.error,agentHttpStatus:agentResponse.httpStatus??null,agentPlansError:agentPlansResponse.ok?null:agentPlansResponse.error,agentPlansHttpStatus:agentPlansResponse.httpStatus??null,plans,checkoutEnabled:env.CHECKOUT_ENABLED==='true',readOnly:true};
-}
-// TEMPORARY read-only metadata verification; sanitized output, no seller credentials.
-async function readProviderFiatPriceSnapshot(env){
- const config=await paymentConfig(env);
- if(config.environment!=='live')return json({ok:false,reason:'NOT_LIVE'});
- const key=await sellerKey(env);
- if(!key)return json({ok:false,reason:'NOT_CONFIGURED'},503);
- const rows=(await q(env,'SELECT p.id,p.price_cents,pl.plan_id FROM products p JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.id IN (?,?,?,?) ORDER BY p.price_cents','package-1','package-2','package-3','package-5').all()).results;
- const outcomes=[];
- for(const p of rows){
-  try{
-   const url='https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id);
-   const res=await fetch(url,{headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(12000)});
-   if(!res.ok){outcomes.push({package:p.id,httpStatus:res.status});continue;}
-   const body=await res.json();
-   const price=body.registry?.price||{};
-   const amounts=Array.isArray(price.amounts)?price.amounts:[];
-   outcomes.push({package:p.id,httpStatus:res.status,billingModel:body.billingModel??null,currency:body.metadata?.plan?.currency??null,fiatProvider:body.metadata?.plan?.fiatPaymentProvider??null,scheme:body.metadata?.plan?.x402Scheme??null,hasStripePriceId:Boolean(body.metadata?.plan?.priceId),amounts:amounts.slice(0,6).map(x=>String(x).slice(0,35)),expectedCents:p.price_cents,registryPriceKeys:Object.keys(price).filter(x=>['amounts','tokenAddress','receivers','isCrypto'].includes(x))});
-  }catch(e){outcomes.push({package:p.id,error:e?.name==='TimeoutError'?'TIMEOUT':'PROVIDER_UNREACHABLE'});}
- }
- return json({ok:outcomes.length===4,plans:outcomes});
 }
 async function changePassword(req,env){const d=await readJSON(req,5000);if(!await passwordOK(env,d.currentPassword))return fail('Current password incorrect',403);if(typeof d.newPassword!=='string'||d.newPassword.length<20||d.newPassword.length>128)return fail('New password must be 20 to 128 characters',400);const changed=await mac(env.SESSION_SECRET,'admin-password:'+d.newPassword);const epoch=String(Number(await getSetting(env,'admin_session_epoch','1'))+1);await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_password_digest',changed),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_session_epoch',epoch)]);await audit(env,'admin_password_rotated');return json({ok:true},200,{'Set-Cookie':cookie('',0)});}
 async function orderSecret(req,env,id){const bearer=req.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];if(!bearer||bearer.length>300)return null;const order=await q(env,'SELECT * FROM orders WHERE id=?',id).first();return order&&equal(order.access_token_hash,await sha(bearer))?order:null;}
@@ -245,7 +224,7 @@ async function ownerTrialStatus(env){
  const claim=await getSetting(env,'owner_first_live_test_claimed');
  let receipt=null;
  if(attempt?.receipt_json){try{const r=JSON.parse(attempt.receipt_json);receipt={providerTransactionId:r.providerTransactionId||null,amountVerified:r.amountVerified===true||Number.isSafeInteger(r.confirmedUsdCents),confirmedUsdCents:Number.isSafeInteger(r.confirmedUsdCents)?r.confirmedUsdCents:null};}catch{}}
- return json({prepared:Boolean(order),orderId:id,packageId:'package-1',priceCents:order?.total_cents??null,currency:order?.currency??null,planId:attempt?.plan_id??null,redemptionUnits:attempt?.credits_requested??null,orderStatus:order?.status??null,attemptStatus:attempt?.status??null,errorCode:attempt?.error_code??null,settlementAttemptClaimed:claim===id,approved:env.OWNER_LIVE_TEST_APPROVED==='true',checkoutEnabled:env.CHECKOUT_ENABLED==='true',paymentRecorded:Boolean(payment),paymentStatus:payment?.status??null,providerTransactionId:payment?.provider_payment_id??receipt?.providerTransactionId??null,usdReconciled:Boolean(payment&&payment.status==='settled'&&payment.currency==='USD'&&payment.amount_cents===order?.total_cents),deliveredKeys:Number(delivery?.n||0),receipt});
+ return json({prepared:Boolean(order),orderId:id,packageId:'package-1',priceCents:order?.total_cents??null,currency:order?.currency??null,planId:attempt?.plan_id??null,redemptionUnits:attempt?.credits_requested??null,orderStatus:order?.status??null,attemptStatus:attempt?.status??null,errorCode:attempt?.error_code??null,settlementAttemptClaimed:claim===id,approved:env.OWNER_LIVE_TEST_APPROVED==='true',checkoutEnabled:env.CHECKOUT_ENABLED==='true',paymentRecorded:Boolean(payment),paymentStatus:payment?.status??null,providerTransactionId:payment?.provider_payment_id??receipt?.providerTransactionId??null,usdReconciled:Boolean(payment&&payment.status==='settled'&&payment.evidence_json&&(()=>{try{return JSON.parse(payment.evidence_json).actualChargeAmountVerified===true;}catch{return false;}})()),deliveredKeys:Number(delivery?.n||0),receipt});
 }
 // Recovery never invokes the facilitator. It may fulfill only a D1-confirmed paid order.
 async function recoverFirstOwnerTrial(env){
@@ -322,6 +301,18 @@ async function chargeFirstOwnerTrial(req,env){
  const internal=new Request(own(req)+'/api/orders/'+id+'/charge',{method:'POST',headers,body:JSON.stringify({token:d.token})});
  return chargeOrder(internal,env,id,true);
 }
+// Authenticate and validate the registered Nevermined fiat PAYG gross price before
+// any live verify/settle. Never use credits as dollars.
+async function verifyPlanGrossPrice(env,config,planId,expectedCents,units){
+ if(config.environment!=='live'&&config.environment!=='sandbox')return {ok:false,reason:'INVALID_ENV'};
+ let res;
+ try{
+  res=await fetch('https://api.'+config.environment+'.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(planId),{method:'GET',headers:{Authorization:'Bearer '+await sellerKey(env),Accept:'application/json'},signal:AbortSignal.timeout(12000),redirect:'manual'});
+ }catch{return {ok:false,reason:'PLAN_LOOKUP_UNAVAILABLE'};}
+ if(!res.ok)return {ok:false,reason:'PLAN_LOOKUP_HTTP_'+res.status};
+ let body;try{body=await res.json();}catch{return {ok:false,reason:'INVALID_PLAN_RESPONSE'};}
+ return validatePaygFiatPlan(body,planId,expectedCents,units);
+}
 async function chargeOrder(req,env,id,ownerTrial=false){
  if(!ownerTrial&&env.CHECKOUT_ENABLED!=='true')return fail('Checkout is not enabled',503);
  const order=await orderSecret(req,env,id);if(!order)return fail('Not found',404);
@@ -332,6 +323,8 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  const d=await readJSON(req,10000);if(typeof d.token!=='string'||d.token.length>8000||d.token.length<8)return fail('Invalid token',402);
  const scope=decodeTokenScope(d.token);if(!scope||scope.planId!==attempt.plan_id)return fail('This token is not authorized for this package Payment Plan',402);
  const config=await paymentConfig(env);if(!config.agentId||scope.agentId&&scope.agentId!==config.agentId||scope.scheme!==config.scheme||scope.network!==config.network)return fail('Token Agent, payment scheme or network mismatch',402);
+ const planPrice=await verifyPlanGrossPrice(env,config,attempt.plan_id,order.total_cents,Number(attempt.credits_requested));
+ if(!planPrice.ok)return fail('Nevermined Plan price could not be verified; no charge attempted: '+planPrice.reason,503);
  const move=await q(env,"UPDATE payment_attempts SET status='verifying' WHERE id=? AND status='created'",attempt.id).run();if(move.meta.changes!==1)return fail('Order already being processed',409);
  await q(env,"UPDATE orders SET status='verifying' WHERE id=? AND status='pending'",id).run();
  if(!await reserve(env,id,attempt.product_id)){
@@ -350,21 +343,21 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='settling' WHERE id=? AND status='verifying'",attempt.id),q(env,"UPDATE orders SET status='settling' WHERE id=?",id)]);
  let settled;
  try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequest?.agentRequestId);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await audit(env,'payment_uncertain',id,safeError(err));await haltCheckout(env,id,'SETTLEMENT_UNCERTAIN');return fail('Payment result is uncertain. Do not retry this order; contact the store owner.',503);}
- const paymentEvidence=settlementEvidence(settled,credits,order.total_cents);
- if(!paymentEvidence?.amountVerified){
-  // Never assume a PAYG redemption unit equals USD. A facilitator response
-  // can indicate successful settlement without proving the actual fiat charge.
-  // Hold this order for reconciliation, without charging or delivering again.
-  const reason=paymentEvidence?'AMOUNT_NOT_VERIFIED':'SETTLEMENT_UNCONFIRMED';
-  const sanitized=paymentEvidence?JSON.stringify({providerTransactionId:paymentEvidence.providerTransactionId,billingModel:'pay-as-you-go',amountVerified:false,orderId:id,planId:attempt.plan_id}):null;
+ const paymentEvidence=settlementEvidence(settled,credits,order.total_cents,planPrice.ok);
+ if(!paymentEvidence){
+  // A PAYG fiat settlement must prove success and return a unique PSP charge id
+  // (Stripe PaymentIntent pi_...). No key may be delivered without this receipt.
+  const reason='SETTLEMENT_UNCONFIRMED';
   await env.DB.batch([
-   q(env,"UPDATE payment_attempts SET status='uncertain',error_code=?,receipt_json=? WHERE id=? AND status='settling'",reason,sanitized,attempt.id),
+   q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=? AND status='settling'",reason,attempt.id),
    q(env,"UPDATE orders SET status='uncertain' WHERE id=? AND status='settling'",id)
   ]);
   await audit(env,'payment_reconciliation_required',id,reason);await haltCheckout(env,id,reason);
-  return fail('Payment result requires independent reconciliation. Do not pay this order again or create a replacement order yet.',503);
+  return fail('Payment result requires provider reconciliation. Do not retry this order or create a replacement until reconciled.',503);
  }
- const evidence=JSON.stringify({providerTransactionId:paymentEvidence.providerTransactionId,billingModel:'pay-as-you-go',confirmedUsdCents:paymentEvidence.confirmedUsdCents,currency:'USD',orderId:id,planId:attempt.plan_id});
+ // The price is authenticated Plan metadata, NOT a claimed amount from settle.
+ // The actual PSP amount is separately reconciled by the provider; never invent it.
+ const evidence=JSON.stringify({providerTransactionId:paymentEvidence.providerTransactionId,billingModel:'pay-as-you-go',network:'stripe',planPriceVerified:true,planPriceSource:'nevermined-plan-registry-6dp',expectedUsdCents:order.total_cents,actualChargeAmountVerified:false,currency:order.currency,orderId:id,planId:attempt.plan_id});
  try{await env.DB.batch([
   q(env,'INSERT INTO payments(id,order_id,provider,provider_payment_id,amount_cents,currency,status,evidence_json) VALUES(?,?,?,?,?,?,?,?)','payment_'+id,id,'nevermined',paymentEvidence.providerTransactionId,order.total_cents,order.currency,'settled',evidence),
   q(env,"UPDATE payment_attempts SET status='settled',receipt_json=?,error_code=NULL WHERE id=? AND status='settling'",evidence,attempt.id),
@@ -385,7 +378,6 @@ export default {async fetch(req,env){
   if(req.method==='GET'&&path==='/trial')return page(buyerTrialPage());
   if(req.method==='GET'&&path==='/api/trial/status')return buyerTrialStatus(req,env);
   if(req.method==='POST'&&path==='/api/trial/charge-once')return chargeBuyerTrial(req,env);
-  if(req.method==='GET'&&path==='/api/_official-plan-price-probe')return readProviderFiatPriceSnapshot(env);
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
 
 
