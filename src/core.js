@@ -1,0 +1,17 @@
+export const json=(value,status=200,extra={})=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...extra}});
+export const fail=(message,status=400)=>json({error:message},status);
+export const b64=(data)=>btoa(String.fromCharCode(...data)).replaceAll('+','-').replaceAll('/','_').replaceAll('=','');
+export const unb64=(value)=>Uint8Array.from(atob(value.replaceAll('-','+').replaceAll('_','/')+'='.repeat((4-value.length%4)%4)),c=>c.charCodeAt(0));
+export const token=(n=32)=>b64(crypto.getRandomValues(new Uint8Array(n)));
+export const equal=(a,b)=>{if(typeof a!=='string'||typeof b!=='string')return false;let bad=a.length^b.length;for(let i=0;i<Math.max(a.length,b.length);i++)bad|=(a.charCodeAt(i)||0)^(b.charCodeAt(i)||0);return bad===0;};
+export async function sha(s){return b64(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s))));}
+export async function mac(secret,s){const k=await crypto.subtle.importKey('raw',new TextEncoder().encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);return b64(new Uint8Array(await crypto.subtle.sign('HMAC',k,new TextEncoder().encode(s))));}
+export async function aes(secret){if(typeof secret!=='string'||secret.length<32)throw Error('Encryption secret missing');const k=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(secret));return crypto.subtle.importKey('raw',k,'AES-GCM',false,['encrypt','decrypt']);}
+export async function encrypt(key,s){const iv=crypto.getRandomValues(new Uint8Array(12));const cipher=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(s));return b64(iv)+'.'+b64(new Uint8Array(cipher));}
+export async function decrypt(key,s){const [i,c]=s.split('.');if(!i||!c)throw Error('Malformed ciphertext');return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(i)},key,unb64(c)));}
+export function parseTXT(text){const keys=[],known=new Set();let invalid=0,duplicates=0;for(const line of text.split(/\r?\n/)){const s=line.trim();if(!s)continue;if(s.length>512||/[\u0000-\u001f]/.test(s)){invalid++;continue;}if(known.has(s)){duplicates++;continue;}known.add(s);keys.push(s);}return {keys,invalid,duplicates};}
+export const cents=(v)=>Number.isSafeInteger(v)&&v>=1&&v<=10000000;
+export const productId=(v)=>typeof v==='string'&&/^[a-z0-9][a-z0-9-]{1,60}$/.test(v);
+export function receiptValid(s,expected){return s?.success===true && Number.isSafeInteger(Number(s.creditsSettled))&&Number(s.creditsSettled)===expected && typeof s.txHash==='string'&&s.txHash.length>=10&&typeof s.permissionHash==='string'&&s.permissionHash.length>4;}
+export function decodeTokenScope(raw){try{let v=raw.trim();if(v.startsWith('x402_'))v=v.slice(5);let value;try{value=JSON.parse(v)}catch{value=JSON.parse(new TextDecoder().decode(unb64(v)))};const a=value?.accepted; if(value?.x402Version!==2||!a||typeof a.planId!=='string')return null;return {planId:a.planId,agentId:a.extra?.agentId||null,scheme:a.scheme,network:a.network};}catch{return null;}}
+export const secureHeaders={'X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Cache-Control':'no-store','Permissions-Policy':'camera=(), microphone=(), geolocation=()'};
