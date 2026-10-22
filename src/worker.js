@@ -36,18 +36,20 @@ async function verifyNeverminedConnection(env,fetcher=fetch){
  const base='https://api.'+config.environment+'.nevermined.app/api/v1/protocol/';
  async function read(path){
   let response;
-  try{response=await fetcher(base+path,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(12000),redirect:'error'});}catch{return {ok:false,error:'CONNECTION_FAILED'};}
-  if(!response.ok)return {ok:false,error:response.status===401||response.status===403?'AUTH_REJECTED':'HTTP_'+response.status};
-  try{const body=await response.json();return {ok:true,body};}catch{return {ok:false,error:'INVALID_RESPONSE'};}
+  try{response=await fetcher(base+path,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(12000),redirect:'error'});}catch(err){const category=err?.name==='TimeoutError'||err?.name==='AbortError'?'TIMEOUT':err?.name==='TypeError'?'NETWORK_OR_DNS':'FETCH_ERROR';return {ok:false,error:category,httpStatus:null};}
+  if(!response.ok)return {ok:false,httpStatus:response.status,error:response.status===401?'UNAUTHORIZED':response.status===403?'FORBIDDEN':response.status===404?'NOT_FOUND':'HTTP_ERROR'};
+  try{const body=await response.json();return {ok:true,body};}catch{return {ok:false,error:'INVALID_RESPONSE',httpStatus:response.status};}
  }
  const agentResponse=await read('agents/'+encodeURIComponent(config.agentId));
+ const agentPlansResponse=await read('agents/'+encodeURIComponent(config.agentId)+'/plans');
  const rows=await q(env,'SELECT p.id,p.price_cents,p.currency,pl.plan_id,pl.credits_per_purchase FROM products p LEFT JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.active=1 AND p.deleted_at IS NULL ORDER BY p.price_cents').all();
- const associated=agentResponse.ok&&Array.isArray(agentResponse.body?.plans)?new Set(agentResponse.body.plans.map(p=>String(p.planId))):null;
+ const planItems=agentPlansResponse.body?.plans;
+ const associated=agentPlansResponse.ok&&Array.isArray(planItems)?new Set(planItems.map(p=>String(p.planId??p.id))):null;
  const plans=[];
  for(const p of rows.results){
   if(!p.plan_id||p.plan_id==='not-configured'){plans.push({productId:p.id,ok:false,error:'PLAN_NOT_CONFIGURED'});continue;}
   const r=await read('plans/'+encodeURIComponent(p.plan_id));
-  if(!r.ok){plans.push({productId:p.id,ok:false,error:r.error});continue;}
+  if(!r.ok){plans.push({productId:p.id,ok:false,error:r.error,httpStatus:r.httpStatus??null});continue;}
   const b=r.body||{},price=b.priceConfig||{},credits=b.creditsConfig||{};
   const linked=associated?associated.has(String(p.plan_id)):null;
   // The public plan schema does not provide an authoritative fiat USD per-request price.
@@ -57,7 +59,7 @@ async function verifyNeverminedConnection(env,fetcher=fetch){
   const creditsMatch=reportedCredits!==null&&reportedCredits===Number(p.credits_per_purchase);
   plans.push({productId:p.id,ok:planIdMatches&&linked===true,planIdMatches,linkedToAgent:linked,expectedUsdCents:p.price_cents,currency:p.currency,creditsPerRequest:p.credits_per_purchase,planCreditAmount:reportedCredits,creditsMatch,priceType:typeof price.priceType==='string'?price.priceType:null,fiatUsdPriceVerified:false,networkVerified:false,schemeVerified:false,priceVerification:'UNVERIFIED_PROVIDER_METADATA'});
  }
- return {ok:agentResponse.ok&&plans.every(p=>p.ok),environment:config.environment,schemeConfigured:config.scheme,networkConfigured:config.network,agentReachable:agentResponse.ok,agentError:agentResponse.ok?null:agentResponse.error,plans,checkoutEnabled:env.CHECKOUT_ENABLED==='true',readOnly:true};
+ return {ok:agentResponse.ok&&plans.every(p=>p.ok),environment:config.environment,schemeConfigured:config.scheme,networkConfigured:config.network,agentReachable:agentResponse.ok,agentError:agentResponse.ok?null:agentResponse.error,agentHttpStatus:agentResponse.httpStatus??null,agentPlansError:agentPlansResponse.ok?null:agentPlansResponse.error,agentPlansHttpStatus:agentPlansResponse.httpStatus??null,plans,checkoutEnabled:env.CHECKOUT_ENABLED==='true',readOnly:true};
 }
 async function changePassword(req,env){const d=await readJSON(req,5000);if(!await passwordOK(env,d.currentPassword))return fail('Current password incorrect',403);if(typeof d.newPassword!=='string'||d.newPassword.length<20||d.newPassword.length>128)return fail('New password must be 20 to 128 characters',400);const changed=await mac(env.SESSION_SECRET,'admin-password:'+d.newPassword);const epoch=String(Number(await getSetting(env,'admin_session_epoch','1'))+1);await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_password_digest',changed),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_session_epoch',epoch)]);await audit(env,'admin_password_rotated');return json({ok:true},200,{'Set-Cookie':cookie('',0)});}
 async function orderSecret(req,env,id){const bearer=req.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];if(!bearer||bearer.length>300)return null;const order=await q(env,'SELECT * FROM orders WHERE id=?',id).first();return order&&equal(order.access_token_hash,await sha(bearer))?order:null;}
