@@ -1,0 +1,1 @@
+{"name":"digital-key-store","version":"1.1.0","private":true,"type":"module","scripts":{"dev":"wrangler dev","deploy":"wrangler deploy","test":"node --test test/*.test.mjs","db:migrate:local":"wrangler d1 migrations apply digital-key-store-db --local","db:migrate:remote":"wrangler d1 migrations apply digital-key-store-db --remote"},"devDependencies":{"wrangler":"^4.0.0"}}
