@@ -164,8 +164,8 @@ async function checkoutHalted(env){return (await getSetting(env,'checkout_emerge
 async function haltCheckout(env,orderId,reason){
  try{await setSetting(env,'checkout_emergency_halt','true');await audit(env,'checkout_emergency_halt',orderId,reason);}catch{}
 }
-// Limited, serialized settlement during initial public launch. A failure leaves
-// the slot occupied and emergency halt set; the owner must reconcile before resuming.
+// Serialize active settlement requests. Completed or uncertain orders release the
+// public slot; their own attempt state and inventory reservation prevent replay.
 async function startupDailyLimitReached(env){
  const n=await q(env,"SELECT COUNT(*) AS n FROM payments WHERE status='settled' AND created_at>=datetime('now','-1 day')").first();
  return Number(n?.n||0)>=20;
@@ -342,6 +342,7 @@ async function chargeOrder(req,env,id,ownerTrial=false){
   publicSlot=true;
  }
  const releasePublicSlot=async()=>{if(publicSlot)await q(env,"DELETE FROM settings WHERE key='public_settlement_slot' AND value=?",id).run();};
+ try {
  const move=await q(env,"UPDATE payment_attempts SET status='verifying' WHERE id=? AND status='created'",attempt.id).run();if(move.meta.changes!==1){await releasePublicSlot();return fail('Order already being processed',409);}
  await q(env,"UPDATE orders SET status='verifying' WHERE id=? AND status='pending'",id).run();
  if(!await reserve(env,id,attempt.product_id)){
@@ -355,11 +356,19 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  let facilitator;
  try{facilitator=createNevermined({NVM_API_KEY:await sellerKey(env),NVM_ENV:config.environment});}catch{await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='NOT_CONFIGURED' WHERE id=?",attempt.id).run();await releasePublicSlot();return fail('Payment provider is not configured',503);}
  let verify;
- try{verify=await facilitator.verify(d.token,paymentRequired,credits);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await haltCheckout(env,id,'VERIFY_UNCERTAIN');return fail('Payment verification uncertain. Do not retry this order; contact the store owner.',503);}
+ try{verify=await facilitator.verify(d.token,paymentRequired,credits);}catch(err){
+  // Verification never calls settlement. A rejected token must not stop every buyer.
+  const code=safeError(err);
+  await release(env,id);
+  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code=? WHERE id=? AND status='verifying'",code,attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=? AND status='verifying'",id)]);
+  await releasePublicSlot();
+  await audit(env,'payment_verification_failed',id,code);
+  return json({error:'Payment verification failed ('+code+'). No settlement was attempted for this order. Check your Nevermined token and selected package.',charged:false,settlementAttempted:false,providerCode:code},err.http>=400&&err.http<500?402:502);
+ }
  if(!isVerified(verify)){await release(env,id);await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='VERIFY_REJECTED' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);await releasePublicSlot();return fail('Token verification was rejected; no key was delivered.',402);}
  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='settling' WHERE id=? AND status='verifying'",attempt.id),q(env,"UPDATE orders SET status='settling' WHERE id=?",id)]);
  let settled;
- try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequest?.agentRequestId);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await audit(env,'payment_uncertain',id,safeError(err));await haltCheckout(env,id,'SETTLEMENT_UNCERTAIN');return fail('Payment result is uncertain. Do not retry this order; contact the store owner.',503);}
+ try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequest?.agentRequestId);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await audit(env,'payment_uncertain',id,safeError(err));return fail('Payment result is uncertain. Do not retry this order; contact the store owner.',503);}
  const paymentEvidence=settlementEvidence(settled,credits,order.total_cents,planPrice.ok);
  if(!paymentEvidence){
   // A PAYG fiat settlement must prove success and return a unique PSP charge id
@@ -369,7 +378,7 @@ async function chargeOrder(req,env,id,ownerTrial=false){
    q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=? AND status='settling'",reason,attempt.id),
    q(env,"UPDATE orders SET status='uncertain' WHERE id=? AND status='settling'",id)
   ]);
-  await audit(env,'payment_reconciliation_required',id,reason);await haltCheckout(env,id,reason);
+  await audit(env,'payment_reconciliation_required',id,reason);
   return fail('Payment result requires provider reconciliation. Do not retry this order or create a replacement until reconciled.',503);
  }
  // The price is authenticated Plan metadata, NOT a claimed amount from settle.
@@ -381,11 +390,12 @@ async function chargeOrder(req,env,id,ownerTrial=false){
   q(env,"UPDATE orders SET status='settled' WHERE id=? AND status='settling'",id)
  ]);}catch{
   try{await q(env,"UPDATE payment_attempts SET status='uncertain',error_code='PERSISTENCE_UNCERTAIN' WHERE id=? AND status='settling'",attempt.id).run();}catch{}
-  await haltCheckout(env,id,'PERSISTENCE_UNCERTAIN');return fail('Payment may have settled. Please use your original order access to recover delivery. Do not pay again.',503);
+  return fail('Payment may have settled. Please use your original order access to recover delivery. Do not pay again.',503);
  }
  await audit(env,'payment_settled',id,JSON.stringify({payment: paymentEvidence.providerTransactionId,credits}));
- const key=await fulfill(env,id);if(!key){await haltCheckout(env,id,'DELIVERY_PENDING');return json({status:'settled',orderId:id,message:'Payment confirmed. Delivery pending; use the same order to recover.'},202);}
+ const key=await fulfill(env,id);if(!key){return json({status:'settled',orderId:id,message:'Payment confirmed. Delivery pending; use the same order to recover.'},202);}
  await releasePublicSlot();return json({status:'delivered',orderId:id,key});
+ } finally { await releasePublicSlot(); }
 }
 export default {async fetch(req,env){
  const path=new URL(req.url).pathname;
