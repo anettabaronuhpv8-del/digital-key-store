@@ -28,6 +28,12 @@ async function updateProduct(req,env,id){const d=await readJSON(req,5000);if(!aw
 async function deleteProduct(env,id){await q(env,'UPDATE products SET active=0,deleted_at=CURRENT_TIMESTAMP WHERE id=? AND deleted_at IS NULL',id).run();await audit(env,'product_deleted',id);return json({ok:true});}
 async function saveConfig(req,env){const d=await readJSON(req,5000);if(typeof d.agentId!=='string'||d.agentId.length>300||!['sandbox','live'].includes(d.environment)||!['nvm:card-delegation','nvm:erc4337'].includes(d.scheme)||typeof d.network!=='string'||!['stripe','braintree','visa','eip155:84532','eip155:8453'].includes(d.network)||typeof d.sellerKey!=='string'||d.sellerKey.length>1500)return fail('Invalid payment settings');if((d.scheme==='nvm:card-delegation'&&!['stripe','braintree','visa'].includes(d.network))||(d.scheme==='nvm:erc4337'&&!d.network.startsWith('eip155:')))return fail('Scheme and network mismatch');if(d.sellerKey){if(!/^(nvm:|sandbox:|live:)/.test(d.sellerKey))return fail('Invalid Nevermined Seller API Key format');await setSetting(env,'seller_key_encrypted',await encrypt(await aes(env.CONFIG_SECRET),d.sellerKey));}await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','agent_id',d.agentId.trim()),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','environment',d.environment),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','scheme',d.scheme),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','network',d.network)]);await audit(env,'payment_config_updated');return json({ok:true});}
 // Read-only Nevermined connectivity diagnostics. Never returns bearer credentials or raw provider payloads.
+// Fixed-origin read-only probe; no credentials, no user-controlled URL, no provider response body.
+async function neverminedOriginProbe(fetcher=fetch){
+ const url='https://api.live.nevermined.app/api/v1/protocol/agents';
+ try{const r=await fetcher(url,{method:'GET',headers:{Accept:'application/json'},signal:AbortSignal.timeout(8000),redirect:'manual'});return {ok:true,httpStatus:r.status,category:r.status===401?'UNAUTHORIZED_EXPECTED':r.status===403?'FORBIDDEN':r.status===404?'NOT_FOUND':'HTTP_RESPONSE',host:'api.live.nevermined.app',path:'/api/v1/protocol/agents'};}
+ catch(e){const name=String(e?.name||'Error');const causeName=String(e?.cause?.name||'');const category=name==='TimeoutError'||name==='AbortError'?'TIMEOUT':name==='TypeError'?'FETCH_TYPE_ERROR':'FETCH_EXCEPTION';return {ok:false,httpStatus:null,category,errorName:['TypeError','AbortError','TimeoutError','Error'].includes(name)?name:'OTHER',causeCategory:causeName==='Error'?'GENERIC_CAUSE':causeName==='TypeError'?'TYPE_CAUSE':'UNKNOWN_CAUSE',host:'api.live.nevermined.app',path:'/api/v1/protocol/agents'};}
+}
 async function verifyNeverminedConnection(env,fetcher=fetch){
  const config=await paymentConfig(env);
  const key=await sellerKey(env);
@@ -156,6 +162,7 @@ export default {async fetch(req,env){
   if(!noCrossSite(req))return fail('Cross-origin requests are not permitted',403);
   if(req.method==='GET'&&path==='/')return page(storefront());
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
+  if(req.method==='GET'&&path==='/api/health/nevermined-origin')return json(await neverminedOriginProbe());
   if(req.method==='GET'&&path==='/api/products')return catalog(env);
   if(req.method==='POST'&&path==='/api/orders')return startOrder(req,env);
   const m=idFrom(path,/^\/api\/orders\/(dks_[a-f0-9-]{36})$/);
