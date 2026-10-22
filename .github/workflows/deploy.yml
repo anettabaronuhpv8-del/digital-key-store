@@ -49,6 +49,15 @@ jobs:
             const d=await r.json();
             console.log("Nevermined origin diagnostic:",JSON.stringify(d));
           '
+      - name: One-shot authenticated Nevermined GET diagnostic (no charge)
+        run: |
+          node --input-type=module -e '
+            const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/nevermined-auth-once";
+            const r=await fetch(u,{signal:AbortSignal.timeout(15000)});
+            if(!r.ok)throw Error("Diagnostic unavailable HTTP "+r.status);
+            const d=await r.json();
+            console.log("Sanitized authenticated Nevermined GET:",JSON.stringify(d));
+          '
       - name: Verify public health and checkout lock
         run: |
           node --input-type=module -e '
