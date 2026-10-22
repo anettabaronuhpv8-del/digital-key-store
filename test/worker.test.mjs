@@ -1,3 +1,4 @@
+import {decodeTokenScope} from '../src/core.js';
 import test from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {readFileSync} from 'node:fs';import worker from '../src/worker.js';import {b64} from '../src/core.js';
 class D1Mock {constructor(){this.db=new DatabaseSync(':memory:');this.db.exec('PRAGMA foreign_keys=ON;');this.db.exec(readFileSync(new URL('../migrations/0001_current_schema.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0005_reservations_admin.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0006_immutable_credits.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0007_manual_reconciliation.sql',import.meta.url),'utf8'));}prepare(sql){const db=this.db;return {bind(...args){const st=db.prepare(sql);return {first:async()=>st.get(...args)||null,all:async()=>({results:st.all(...args)}),run:async()=>({meta:{changes:st.run(...args).changes}})};}}}async batch(stmts){this.db.exec('BEGIN');try{const out=[];for(const s of stmts)out.push(await s.run());this.db.exec('COMMIT');return out;}catch(e){this.db.exec('ROLLBACK');throw e;}}}
 const secret='a-long-secret-for-test-purposes-must-be-thirty-two-bytes-abc';
@@ -20,7 +21,7 @@ function mockFacilitator({verify=true,settle=true,delay=0,noReceipt=false}={}){
   if(delay)await new Promise(r=>setTimeout(r,delay));
   if(String(url).includes('/api/v1/protocol/plans/'))return mockPlanResponse(url);
   const body=JSON.parse(opt.body);
-  if(url.endsWith('/verify'))return Response.json({isValid:verify,agentRequest:{agentRequestId:'request-mock-'+(++tx)}});
+  if(url.endsWith('/verify')){const tokenScope=decodeTokenScope(body.x402AccessToken);const expected=body.paymentRequired?.accepts?.[0]?.planId;return Response.json({isValid:verify&&tokenScope?.planId===expected,agentRequest:{agentRequestId:'request-mock-'+(++tx)}});}
   if(url.endsWith('/settle')){
    if(settle==='timeout')throw Error('timeout');
    if(settle==='error')return Response.json({code:'BCK.X402.0049'},{status:400});
