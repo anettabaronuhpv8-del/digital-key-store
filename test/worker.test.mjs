@@ -80,3 +80,24 @@ test('extension x402 checkout stays in place without buyer portal',async()=>{
  assert.doesNotMatch(html,/Open Nevermined Buyer Portal/);
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
 });
+
+test('reused provider transaction receipt cannot deliver a second key',async()=>{
+ const e=env();await setup(e,{items:{'package-1':3}});e.CHECKOUT_ENABLED='true';
+ const original=globalThis.fetch;let settleCount=0;
+ globalThis.fetch=async(url,opt)=>{
+  if(url.endsWith('/verify'))return Response.json({isValid:true,agentRequest:{agentRequestId:'fresh-request-'+(++settleCount)}});
+  if(url.endsWith('/settle'))return Response.json({success:true,billingModel:'pay-as-you-go',orderTx:{id:'same_provider_transaction_123456',amountCents:100,currency:'USD'}});
+  throw Error('Unexpected URL');
+ };
+ try{
+  const token=keyToken('plan-package-1');
+  const first=await purchase(e,'package-1',token);
+  assert.equal(first.charge.status,200);
+  const second=await purchase(e,'package-1',token);
+  assert.equal(second.charge.status,503);
+  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,1);
+  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,1);
+  assert.equal(e.DB.db.prepare("SELECT count(*) n FROM inventory WHERE status='sold'").get().n,1);
+  assert.equal(e.DB.db.prepare("SELECT count(*) n FROM payment_attempts WHERE status='uncertain'").get().n,1);
+ }finally{globalThis.fetch=original;}
+});
