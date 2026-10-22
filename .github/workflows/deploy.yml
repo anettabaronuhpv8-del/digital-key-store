@@ -52,3 +52,21 @@ jobs:
             if(data.ok!==true||data.checkoutEnabled!==expected)throw Error("Worker health or checkout activation does not match source configuration");
             console.log("Production health passed; checkout "+(expected?"enabled":"locked")+".");
           '
+      - name: Verify four public key purchase offers
+        run: |
+          node --input-type=module -e '
+            const origin="https://digital-key-store.anettabaronuhpv8.workers.dev";
+            const r=await fetch(origin+"/api/products",{headers:{"Cache-Control":"no-cache"}});
+            if(!r.ok)throw Error("Catalog unavailable: "+r.status);
+            const d=await r.json();
+            if(d.checkoutEnabled===true){
+              const expected={"package-1":100,"package-2":200,"package-3":300,"package-5":500};
+              for(const [id,cents] of Object.entries(expected)){
+                const p=d.products.find(x=>x.id===id);
+                if(!p||p.price_cents!==cents||p.stock<1||p.ready!==true)throw Error("Public Buy button not ready for "+id);
+              }
+              const home=await fetch(origin);
+              if(!home.ok||!(await home.text()).includes("Buy 1 Key"))throw Error("Buyer storefront is not rendering purchase controls");
+              console.log("Public checkout offers verified: $1, $2, $3, $5; Buyer x402 checkout enabled.");
+            }else console.log("Public checkout locked; catalog checked without enabling payment.");
+          '
