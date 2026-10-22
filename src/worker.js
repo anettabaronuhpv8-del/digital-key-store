@@ -178,8 +178,8 @@ async function haltCheckout(env,orderId,reason){
 // Serialize active settlement requests. Completed or uncertain orders release the
 // public slot; their own attempt state and inventory reservation prevent replay.
 async function startupDailyLimitReached(env){
- const n=await q(env,"SELECT COUNT(*) AS n FROM payments WHERE status='settled' AND created_at>=datetime('now','-1 day')").first();
- return Number(n?.n||0)>=20;
+ // The initial 20-payment trial cap must not interrupt public sales.
+ return false;
 }
 
 async function startOrder(req,env){
