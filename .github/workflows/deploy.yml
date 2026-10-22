@@ -40,13 +40,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx wrangler deploy --keep-vars
-      - name: Verify public health and checkout lock
+      - name: Verify public health and configured checkout state
         run: |
           node --input-type=module -e '
             const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health";
             const r=await fetch(u,{headers:{"Cache-Control":"no-cache"}});
             if(!r.ok)throw Error("Worker health endpoint failed: "+r.status);
             const data=await r.json();
-            if(data.ok!==true||data.checkoutEnabled!==false)throw Error("Worker health or checkout lock invalid");
-            console.log("Production health passed; checkout remains disabled.");
+            const {readFileSync}=await import("node:fs");
+            const expected=/CHECKOUT_ENABLED\s*=\s*"true"/.test(readFileSync("wrangler.toml","utf8"));
+            if(data.ok!==true||data.checkoutEnabled!==expected)throw Error("Worker health or checkout activation does not match source configuration");
+            console.log("Production health passed; checkout "+(expected?"enabled":"locked")+".");
           '
