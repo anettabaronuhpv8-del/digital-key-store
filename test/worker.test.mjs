@@ -29,3 +29,31 @@ test('paid but delivery unavailable can recover without new settlement',async()=
 
 test('owner password rotation revokes existing sessions',async()=>{const e=env();const cookie=await setup(e,{items:{'package-1':1}});const response=await result(await go(e,'/api/admin/password','PUT',{currentPassword:e.ADMIN_BOOTSTRAP_PASSWORD,newPassword:'new-long-owner-password-with-random-characters-1234'},undefined,cookie));assert.equal(response.status,200);assert.equal((await go(e,'/api/admin/dashboard','GET',undefined,undefined,cookie)).status,403);assert.equal((await go(e,'/api/admin/login','POST',{password:e.ADMIN_BOOTSTRAP_PASSWORD})).status,403);assert.equal((await go(e,'/api/admin/login','POST',{password:'new-long-owner-password-with-random-characters-1234'})).status,200);});
 test('credits are snapped to original order and plan changes block settlement',async()=>{const e=env();const cookie=await setup(e,{items:{'package-1':1}});e.CHECKOUT_ENABLED='true';mockFacilitator();const o=await result(await go(e,'/api/orders','POST',{productId:'package-1'}));assert.equal(o.status,201);await go(e,'/api/admin/products/package-1','PUT',{name:'Package updated',description:'Synthetic',priceCents:500,active:true,planId:'plan-package-1',credits:500,planEnabled:true},undefined,cookie);const c=await result(await go(e,'/api/orders/'+o.body.orderId+'/charge','POST',{token:keyToken('plan-package-1')},o.body.deliveryToken));assert.equal(c.status,409);assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);});
+test('owner can prepare exactly one $1 Live test without charging, enabling checkout or delivering keys',async()=>{
+ const e=env();const cookie=await setup(e,{items:{'package-1':2}});
+ assert.equal((await go(e,'/api/admin/live-test/prepare','POST',{})).status,403);
+ assert.equal((await go(e,'/api/admin/live-test/prepare','POST',{},undefined,cookie)).status,409);
+ const c=await go(e,'/api/admin/config','PUT',{agentId:'agent-123',environment:'live',scheme:'nvm:card-delegation',network:'stripe',sellerKey:''},undefined,cookie);
+ assert.equal(c.status,200);
+ const x=await go(e,'/api/admin/products/package-1','PUT',{name:'Package 1',description:'Synthetic',priceCents:100,active:true,planId:'plan-package-1',credits:1,planEnabled:true},undefined,cookie);
+ assert.equal(x.status,200);
+ const first=await result(await go(e,'/api/admin/live-test/prepare','POST',{},undefined,cookie));
+ assert.equal(first.status,200);
+ assert.equal(first.body.priceCents,100);
+ assert.equal(first.body.redemptionUnits,1);
+ assert.equal(first.body.notCharged,true);
+ assert.equal(first.body.chargeAuthorized,false);
+ assert.equal(first.body.paymentRequired.accepts[0].network,'stripe');
+ assert.equal(first.body.paymentRequired.resource.url,'https://store.example/api/orders/'+first.body.orderId+'/charge');
+ const again=await result(await go(e,'/api/admin/live-test/prepare','POST',{},undefined,cookie));
+ assert.equal(again.status,200);
+ assert.equal(first.body.orderId,again.body.orderId);
+ assert.equal(first.body.deliveryToken,again.body.deliveryToken);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM orders').get().n,1);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payment_attempts').get().n,1);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
+ assert.equal(e.DB.db.prepare("SELECT count(*) n FROM inventory WHERE status='available'").get().n,2);
+ assert.equal((await go(e,'/api/orders','POST',{productId:'package-1'})).status,503);
+ assert.equal((await go(e,'/api/orders/'+first.body.orderId+'/charge','POST',{token:keyToken('plan-package-1')},first.body.deliveryToken)).status,503);
+});
