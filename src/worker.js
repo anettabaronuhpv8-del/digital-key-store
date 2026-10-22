@@ -21,7 +21,7 @@ async function login(req,env){if(!env.ADMIN_BOOTSTRAP_PASSWORD||!env.SESSION_SEC
 async function readJSON(req,max=250000){const size=Number(req.headers.get('Content-Length')||0);if(size>max)throw Object.assign(Error('Request too large'),{http:413});const text=await req.text();if(text.length>max)throw Object.assign(Error('Request too large'),{http:413});try{return JSON.parse(text);}catch{throw Object.assign(Error('Invalid JSON'),{http:400});}}
 const idFrom=(path,re)=>path.match(re)?.[1];
 async function listProducts(env,includeInactive=false){const where=includeInactive?'':'WHERE p.active=1 AND p.deleted_at IS NULL';const sql=`SELECT p.id,p.name,p.description,p.price_cents,p.currency,p.active,p.deleted_at,COALESCE(pl.plan_id,'') plan_id,COALESCE(pl.credits_per_purchase,1) credits_per_purchase,COALESCE(pl.enabled,0) plan_enabled,(SELECT COUNT(*) FROM inventory i WHERE i.product_id=p.id AND i.status='available' AND NOT EXISTS(SELECT 1 FROM inventory_reservations r WHERE r.inventory_id=i.id AND r.state='reserved')) stock,(SELECT COUNT(*) FROM inventory i WHERE i.product_id=p.id AND i.status='sold') sold,(SELECT COALESCE(SUM(pm.amount_cents),0) FROM payments pm JOIN order_items oi ON oi.order_id=pm.order_id WHERE oi.product_id=p.id AND pm.status='settled') revenue_cents FROM products p LEFT JOIN product_payment_plans pl ON pl.product_id=p.id ${where} ORDER BY p.price_cents,p.created_at`;return (await q(env,sql).all()).results;}
-async function catalog(env){const products=await listProducts(env);const active=env.CHECKOUT_ENABLED==='true'&&await configured(env);return json({checkoutEnabled:active,products:products.map(p=>({id:p.id,name:p.name,description:p.description,price_cents:p.price_cents,currency:p.currency,stock:p.stock,paymentPlanId:p.plan_enabled&&p.plan_id?p.plan_id:null,ready:Boolean(active&&p.stock>0&&p.plan_enabled&&p.plan_id)}))});}
+async function catalog(env){const products=await listProducts(env);const active=env.CHECKOUT_ENABLED==='true'&&!await checkoutHalted(env)&&!await startupDailyLimitReached(env)&&await configured(env);return json({checkoutEnabled:active,products:products.map(p=>({id:p.id,name:p.name,description:p.description,price_cents:p.price_cents,currency:p.currency,stock:p.stock,paymentPlanId:p.plan_enabled&&p.plan_id?p.plan_id:null,ready:Boolean(active&&p.stock>0&&p.plan_enabled&&p.plan_id)}))});}
 async function dashboard(env){const products=await listProducts(env,true);const orders=(await q(env,'SELECT o.id,o.status,o.total_cents,o.currency,o.created_at,p.name product_name FROM orders o JOIN order_items oi ON oi.order_id=o.id JOIN products p ON oi.product_id=p.id ORDER BY o.created_at DESC LIMIT 100').all()).results;const history=(await q(env,'SELECT action,entity_id,created_at FROM audit_log ORDER BY id DESC LIMIT 100').all()).results;const payments=(await q(env,'SELECT pa.order_id,pa.status,pa.error_code,pa.created_at,p.amount_cents,p.provider_payment_id FROM payment_attempts pa LEFT JOIN payments p ON p.order_id=pa.order_id ORDER BY pa.created_at DESC LIMIT 100').all()).results;const deliveries=(await q(env,'SELECT d.order_id,pr.name product_name,d.delivered_at FROM deliveries d JOIN order_items oi ON oi.id=d.order_item_id JOIN products pr ON pr.id=oi.product_id ORDER BY d.delivered_at DESC LIMIT 100').all()).results;const refunds=(await q(env,'SELECT order_id,amount_cents,method,refunded_on,reference,status FROM manual_refunds ORDER BY created_at DESC LIMIT 100').all()).results;const manualDeliveries=(await q(env,'SELECT order_id,created_at FROM manual_deliveries ORDER BY created_at DESC LIMIT 100').all()).results;const settings=await paymentConfig(env);return json({products,orders,history,payments,deliveries,refunds,manualDeliveries,settings,sellerKeyConfigured:Boolean(await sellerKey(env)),checkoutEnabled:env.CHECKOUT_ENABLED==='true'});}
 // Owner records actual manual actions only. Neither route invokes Nevermined or transfers funds.
 async function recordManualDelivery(req,env,id){
@@ -164,8 +164,15 @@ async function checkoutHalted(env){return (await getSetting(env,'checkout_emerge
 async function haltCheckout(env,orderId,reason){
  try{await setSetting(env,'checkout_emergency_halt','true');await audit(env,'checkout_emergency_halt',orderId,reason);}catch{}
 }
+// Limited, serialized settlement during initial public launch. A failure leaves
+// the slot occupied and emergency halt set; the owner must reconcile before resuming.
+async function startupDailyLimitReached(env){
+ const n=await q(env,"SELECT COUNT(*) AS n FROM payments WHERE status='settled' AND created_at>=datetime('now','-1 day')").first();
+ return Number(n?.n||0)>=20;
+}
+
 async function startOrder(req,env){
- if(env.CHECKOUT_ENABLED!=='true'||await checkoutHalted(env)||!await configured(env))return fail('Checkout is not enabled',503);
+ if(env.CHECKOUT_ENABLED!=='true'||await checkoutHalted(env)||await startupDailyLimitReached(env)||!await configured(env))return fail('Checkout is temporarily unavailable',503);
  const d=await readJSON(req,1000);if(!productId(d.productId)||(d.quantity!==undefined&&d.quantity!==1))return fail('Only one key can be purchased');
  const p=await q(env,'SELECT p.id,p.price_cents,p.currency,pl.plan_id,pl.credits_per_purchase FROM products p JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.id=? AND p.active=1 AND p.deleted_at IS NULL AND pl.enabled=1',d.productId).first();
  if(!p)return fail('Product unavailable for checkout',409);
@@ -325,21 +332,29 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  const config=await paymentConfig(env);if(!config.agentId||scope.agentId&&scope.agentId!==config.agentId||scope.scheme!==config.scheme||scope.network!==config.network)return fail('Token Agent, payment scheme or network mismatch',402);
  const planPrice=await verifyPlanGrossPrice(env,config,attempt.plan_id,order.total_cents,Number(attempt.credits_requested));
  if(!planPrice.ok)return fail('Nevermined Plan price could not be verified; no charge attempted: '+planPrice.reason,503);
- const move=await q(env,"UPDATE payment_attempts SET status='verifying' WHERE id=? AND status='created'",attempt.id).run();if(move.meta.changes!==1)return fail('Order already being processed',409);
+ if(!ownerTrial&&await startupDailyLimitReached(env))return fail('Initial launch daily settlement limit reached',429);
+ let publicSlot=false;
+ if(!ownerTrial){
+  const lock=await q(env,"INSERT OR IGNORE INTO settings(key,value) VALUES('public_settlement_slot',?)",id).run();
+  if(lock.meta.changes!==1)return fail('Another order is being settled. No charge attempted; retry later.',429);
+  publicSlot=true;
+ }
+ const releasePublicSlot=async()=>{if(publicSlot)await q(env,"DELETE FROM settings WHERE key='public_settlement_slot' AND value=?",id).run();};
+ const move=await q(env,"UPDATE payment_attempts SET status='verifying' WHERE id=? AND status='created'",attempt.id).run();if(move.meta.changes!==1){await releasePublicSlot();return fail('Order already being processed',409);}
  await q(env,"UPDATE orders SET status='verifying' WHERE id=? AND status='pending'",id).run();
  if(!await reserve(env,id,attempt.product_id)){
   await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='OUT_OF_STOCK' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);
-  return fail('Out of stock. You were not charged.',409);
+  await releasePublicSlot();return fail('Out of stock. You were not charged.',409);
  }
  const plan=await q(env,'SELECT credits_per_purchase FROM product_payment_plans WHERE product_id=? AND enabled=1 AND plan_id=?',attempt.product_id,attempt.plan_id).first();
- if(!plan||Number(plan.credits_per_purchase)!==Number(attempt.credits_requested)){await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='PLAN_CHANGED' WHERE id=?",attempt.id).run();return fail('Payment Plan changed. No charge attempted.',409);}
+ if(!plan||Number(plan.credits_per_purchase)!==Number(attempt.credits_requested)){await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='PLAN_CHANGED' WHERE id=?",attempt.id).run();await releasePublicSlot();return fail('Payment Plan changed. No charge attempted.',409);}
  const credits=Number(attempt.credits_requested);
  const paymentRequired=buildPaymentRequiredForOrder({planId:attempt.plan_id,agentId:config.agentId,scheme:config.scheme,network:config.network,resourceUrl:own(req)+'/api/orders/'+id+'/charge'});
  let facilitator;
- try{facilitator=createNevermined({NVM_API_KEY:await sellerKey(env),NVM_ENV:config.environment});}catch{await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='NOT_CONFIGURED' WHERE id=?",attempt.id).run();return fail('Payment provider is not configured',503);}
+ try{facilitator=createNevermined({NVM_API_KEY:await sellerKey(env),NVM_ENV:config.environment});}catch{await release(env,id);await q(env,"UPDATE payment_attempts SET status='failed',error_code='NOT_CONFIGURED' WHERE id=?",attempt.id).run();await releasePublicSlot();return fail('Payment provider is not configured',503);}
  let verify;
  try{verify=await facilitator.verify(d.token,paymentRequired,credits);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await haltCheckout(env,id,'VERIFY_UNCERTAIN');return fail('Payment verification uncertain. Do not retry this order; contact the store owner.',503);}
- if(!isVerified(verify)){await release(env,id);await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='VERIFY_REJECTED' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);return fail('Token verification was rejected; no key was delivered.',402);}
+ if(!isVerified(verify)){await release(env,id);await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='VERIFY_REJECTED' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);await releasePublicSlot();return fail('Token verification was rejected; no key was delivered.',402);}
  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='settling' WHERE id=? AND status='verifying'",attempt.id),q(env,"UPDATE orders SET status='settling' WHERE id=?",id)]);
  let settled;
  try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequest?.agentRequestId);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await audit(env,'payment_uncertain',id,safeError(err));await haltCheckout(env,id,'SETTLEMENT_UNCERTAIN');return fail('Payment result is uncertain. Do not retry this order; contact the store owner.',503);}
@@ -368,7 +383,7 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  }
  await audit(env,'payment_settled',id,JSON.stringify({payment: paymentEvidence.providerTransactionId,credits}));
  const key=await fulfill(env,id);if(!key){await haltCheckout(env,id,'DELIVERY_PENDING');return json({status:'settled',orderId:id,message:'Payment confirmed. Delivery pending; use the same order to recover.'},202);}
- return json({status:'delivered',orderId:id,key});
+ await releasePublicSlot();return json({status:'delivered',orderId:id,key});
 }
 export default {async fetch(req,env){
  const path=new URL(req.url).pathname;
