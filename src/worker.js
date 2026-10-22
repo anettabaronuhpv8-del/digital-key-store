@@ -101,6 +101,27 @@ async function verifyNeverminedConnection(env,fetcher=fetch){
  }
  return {ok:agentResponse.ok&&plans.every(p=>p.ok),keyPrefixCategory:keyEnvironment,keyEnvironmentMismatch:(keyEnvironment==='live'||keyEnvironment==='sandbox')&&keyEnvironment!==config.environment,environment:config.environment,schemeConfigured:config.scheme,networkConfigured:config.network,agentReachable:agentResponse.ok,agentError:agentResponse.ok?null:agentResponse.error,agentHttpStatus:agentResponse.httpStatus??null,agentPlansError:agentPlansResponse.ok?null:agentPlansResponse.error,agentPlansHttpStatus:agentPlansResponse.httpStatus??null,plans,checkoutEnabled:env.CHECKOUT_ENABLED==='true',readOnly:true};
 }
+// TEMPORARY read-only metadata verification; sanitized output, no seller credentials.
+async function readProviderFiatPriceSnapshot(env){
+ const config=await paymentConfig(env);
+ if(config.environment!=='live')return json({ok:false,reason:'NOT_LIVE'});
+ const key=await sellerKey(env);
+ if(!key)return json({ok:false,reason:'NOT_CONFIGURED'},503);
+ const rows=(await q(env,'SELECT p.id,p.price_cents,pl.plan_id FROM products p JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.id IN (?,?,?,?) ORDER BY p.price_cents','package-1','package-2','package-3','package-5').all()).results;
+ const outcomes=[];
+ for(const p of rows){
+  try{
+   const url='https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id);
+   const res=await fetch(url,{headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(12000)});
+   if(!res.ok){outcomes.push({package:p.id,httpStatus:res.status});continue;}
+   const body=await res.json();
+   const price=body.registry?.price||{};
+   const amounts=Array.isArray(price.amounts)?price.amounts:[];
+   outcomes.push({package:p.id,httpStatus:res.status,billingModel:body.billingModel??null,currency:body.metadata?.plan?.currency??null,fiatProvider:body.metadata?.plan?.fiatPaymentProvider??null,scheme:body.metadata?.plan?.x402Scheme??null,hasStripePriceId:Boolean(body.metadata?.plan?.priceId),amounts:amounts.slice(0,6).map(x=>String(x).slice(0,35)),expectedCents:p.price_cents,registryPriceKeys:Object.keys(price).filter(x=>['amounts','tokenAddress','receivers','isCrypto'].includes(x))});
+  }catch(e){outcomes.push({package:p.id,error:e?.name==='TimeoutError'?'TIMEOUT':'PROVIDER_UNREACHABLE'});}
+ }
+ return json({ok:outcomes.length===4,plans:outcomes});
+}
 async function changePassword(req,env){const d=await readJSON(req,5000);if(!await passwordOK(env,d.currentPassword))return fail('Current password incorrect',403);if(typeof d.newPassword!=='string'||d.newPassword.length<20||d.newPassword.length>128)return fail('New password must be 20 to 128 characters',400);const changed=await mac(env.SESSION_SECRET,'admin-password:'+d.newPassword);const epoch=String(Number(await getSetting(env,'admin_session_epoch','1'))+1);await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_password_digest',changed),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_session_epoch',epoch)]);await audit(env,'admin_password_rotated');return json({ok:true},200,{'Set-Cookie':cookie('',0)});}
 async function orderSecret(req,env,id){const bearer=req.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];if(!bearer||bearer.length>300)return null;const order=await q(env,'SELECT * FROM orders WHERE id=?',id).first();return order&&equal(order.access_token_hash,await sha(bearer))?order:null;}
 // Admin-only preparation. Creates no charge, performs no verification/settlement,
@@ -364,6 +385,7 @@ export default {async fetch(req,env){
   if(req.method==='GET'&&path==='/trial')return page(buyerTrialPage());
   if(req.method==='GET'&&path==='/api/trial/status')return buyerTrialStatus(req,env);
   if(req.method==='POST'&&path==='/api/trial/charge-once')return chargeBuyerTrial(req,env);
+  if(req.method==='GET'&&path==='/api/_official-plan-price-probe')return readProviderFiatPriceSnapshot(env);
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
 
 
