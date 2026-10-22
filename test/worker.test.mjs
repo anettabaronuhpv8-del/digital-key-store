@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {readFileSync} from 'node:fs';import worker from '../src/worker.js';import {b64} from '../src/core.js';
-class D1Mock {constructor(){this.db=new DatabaseSync(':memory:');this.db.exec('PRAGMA foreign_keys=ON;');this.db.exec(readFileSync(new URL('../migrations/0001_current_schema.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0005_reservations_admin.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0006_immutable_credits.sql',import.meta.url),'utf8'));}prepare(sql){const db=this.db;return {bind(...args){const st=db.prepare(sql);return {first:async()=>st.get(...args)||null,all:async()=>({results:st.all(...args)}),run:async()=>({meta:{changes:st.run(...args).changes}})};}}}async batch(stmts){this.db.exec('BEGIN');try{const out=[];for(const s of stmts)out.push(await s.run());this.db.exec('COMMIT');return out;}catch(e){this.db.exec('ROLLBACK');throw e;}}}
+class D1Mock {constructor(){this.db=new DatabaseSync(':memory:');this.db.exec('PRAGMA foreign_keys=ON;');this.db.exec(readFileSync(new URL('../migrations/0001_current_schema.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0005_reservations_admin.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0006_immutable_credits.sql',import.meta.url),'utf8'));this.db.exec(readFileSync(new URL('../migrations/0007_manual_reconciliation.sql',import.meta.url),'utf8'));}prepare(sql){const db=this.db;return {bind(...args){const st=db.prepare(sql);return {first:async()=>st.get(...args)||null,all:async()=>({results:st.all(...args)}),run:async()=>({meta:{changes:st.run(...args).changes}})};}}}async batch(stmts){this.db.exec('BEGIN');try{const out=[];for(const s of stmts)out.push(await s.run());this.db.exec('COMMIT');return out;}catch(e){this.db.exec('ROLLBACK');throw e;}}}
 const secret='a-long-secret-for-test-purposes-must-be-thirty-two-bytes-abc';
 const env=()=>({DB:new D1Mock(),CHECKOUT_ENABLED:'false',ADMIN_BOOTSTRAP_PASSWORD:'secure-test-password-very-long',SESSION_SECRET:secret+'session',INVENTORY_SECRET:secret+'inventory',CONFIG_SECRET:secret+'configuration'});
 const request=(path,method='GET',data,authorization,cookie)=>new Request('https://store.example'+path,{method,headers:{...(method!=='GET'?{'Origin':'https://store.example','Content-Type':'application/json'}:{}),...(authorization?{'Authorization':'Bearer '+authorization}:{}),...(cookie?{'Cookie':cookie}:{})},body:data===undefined?undefined:JSON.stringify(data)});
@@ -139,3 +139,24 @@ test('owner recovery cannot deliver or charge an unpaid trial',async()=>{
 });
 
 test('buyer retains existing in-memory payment token during repeat purchase',async()=>{const e=env();const page=await (await go(e,'/')).text();assert.ok(page.includes('const previous=picked?.id'));assert.ok(page.includes('openCheckout(previous)'));assert.ok(!page.includes('localStorage.setItem'));});
+
+test('manual refund is owner-reported, duplicate-safe, and never triggers payment or transfer',async()=>{
+ const e=env();const cookie=await setup(e,{items:{'package-1':2}});const old=await result(await go(e,'/api/orders','POST',{productId:'package-1'}));assert.equal(old.status,503);
+ e.CHECKOUT_ENABLED='true';const created=await result(await go(e,'/api/orders','POST',{productId:'package-1'}));e.CHECKOUT_ENABLED='false';assert.equal(created.status,201);
+ const path='/api/admin/orders/'+created.body.orderId+'/manual-refund';const body={amountCents:100,method:'bank_transfer',refundedOn:'2026-10-22',reference:'SYNTHETIC_REFUND_ALREADY_SENT'};
+ assert.equal((await go(e,path,'POST',body)).status,403);
+ assert.equal((await go(e,path,'POST',body,undefined,cookie)).status,409);
+ e.DB.db.prepare("UPDATE payment_attempts SET status='uncertain' WHERE order_id=?").run(created.body.orderId);
+ const saved=await result(await go(e,path,'POST',body,undefined,cookie));assert.equal(saved.status,200);assert.equal(saved.body.providerConfirmed,false);assert.equal(saved.body.providerRefundExecuted,false);
+ assert.equal((await go(e,path,'POST',body,undefined,cookie)).status,409);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM manual_refunds').get().n,1);
+ assert.equal(e.DB.db.prepare('SELECT status FROM manual_refunds').get().status,'owner_reported');
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+});
+test('manual delivery cannot allocate unpaid inventory or deliver twice',async()=>{
+ const e=env();const cookie=await setup(e,{items:{'package-1':2}});e.CHECKOUT_ENABLED='true';const o=await result(await go(e,'/api/orders','POST',{productId:'package-1'}));e.CHECKOUT_ENABLED='false';const path='/api/admin/orders/'+o.body.orderId+'/manual-delivery';
+ assert.equal((await go(e,path,'POST',{note:'Customer given one key privately'})).status,403);
+ assert.equal((await go(e,path,'POST',{note:'Customer given one key privately'},undefined,cookie)).status,409);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
+ assert.equal(e.DB.db.prepare("SELECT count(*) n FROM inventory WHERE status='sold'").get().n,0);
+});
