@@ -28,6 +28,13 @@ async function updateProduct(req,env,id){const d=await readJSON(req,5000);if(!aw
 async function deleteProduct(env,id){await q(env,'UPDATE products SET active=0,deleted_at=CURRENT_TIMESTAMP WHERE id=? AND deleted_at IS NULL',id).run();await audit(env,'product_deleted',id);return json({ok:true});}
 async function saveConfig(req,env){const d=await readJSON(req,5000);if(typeof d.agentId!=='string'||d.agentId.length>300||!['sandbox','live'].includes(d.environment)||!['nvm:card-delegation','nvm:erc4337'].includes(d.scheme)||typeof d.network!=='string'||!['stripe','braintree','visa','eip155:84532','eip155:8453'].includes(d.network)||typeof d.sellerKey!=='string'||d.sellerKey.length>1500)return fail('Invalid payment settings');if((d.scheme==='nvm:card-delegation'&&!['stripe','braintree','visa'].includes(d.network))||(d.scheme==='nvm:erc4337'&&!d.network.startsWith('eip155:')))return fail('Scheme and network mismatch');if(d.sellerKey){if(!/^(nvm:|sandbox:|live:)/.test(d.sellerKey))return fail('Invalid Nevermined Seller API Key format');await setSetting(env,'seller_key_encrypted',await encrypt(await aes(env.CONFIG_SECRET),d.sellerKey));}await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','agent_id',d.agentId.trim()),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','environment',d.environment),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','scheme',d.scheme),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','network',d.network)]);await audit(env,'payment_config_updated');return json({ok:true});}
 // Read-only Nevermined connectivity diagnostics. Never returns bearer credentials or raw provider payloads.
+async function paygMetadataOnce(env,fetcher=fetch){
+ const name='payg_metadata_once_20261022';const prior=await getSetting(env,name);if(prior)return JSON.parse(prior);
+ const lock=await q(env,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',name,'{}').run();if(lock.meta.changes!==1)return {status:'ALREADY_RUNNING'};
+ const key=await sellerKey(env);const config=await paymentConfig(env);const rows=await q(env,'SELECT p.id,pl.plan_id FROM products p JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.deleted_at IS NULL ORDER BY p.price_cents').all();const plans=[];
+ if(key&&config.environment==='live')for(const p of rows.results){try{const r=await fetcher('https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id),{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(10000),redirect:'manual'});if(!r.ok){plans.push({package:p.id,status:r.status});continue;}const b=await r.json();const reg=b.registry||{};const mp=b.metadata?.plan||{};const scalar=(x)=>typeof x==='number'||typeof x==='boolean'||typeof x==='string'&&x.length<80?x:null;plans.push({package:p.id,status:r.status,billingModel:scalar(b.billingModel),network:scalar(b.network),registryPrice:scalar(reg.price),registryCredits:scalar(reg.credits),metadataPlanKeys:Object.keys(mp).slice(0,24),metadataPlanScalars:Object.fromEntries(Object.entries(mp).filter(([k,v])=>/price|amount|currency|credit|billing|network|scheme|payment|unit/i.test(k)&&scalar(v)!==null).map(([k,v])=>[k,scalar(v)])),registryTypes:Object.fromEntries(Object.entries(reg).map(([k,v])=>[k,typeof v]))});}catch(e){plans.push({package:p.id,error:e?.name==='TimeoutError'?'TIMEOUT':'FETCH_ERROR'})}}
+ const out={readOnly:true,plans};await setSetting(env,name,JSON.stringify(out));return out;
+}
 async function verifyNeverminedConnection(env,fetcher=fetch){
  const config=await paymentConfig(env);
  const key=await sellerKey(env);
@@ -158,6 +165,7 @@ export default {async fetch(req,env){
   if(!noCrossSite(req))return fail('Cross-origin requests are not permitted',403);
   if(req.method==='GET'&&path==='/')return page(storefront());
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
+  if(req.method==='GET'&&path==='/api/health/payg-metadata-once')return json(await paygMetadataOnce(env));
 
 
 
