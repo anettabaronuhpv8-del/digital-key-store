@@ -66,3 +66,19 @@ test('owner-only token verification cannot settle or deliver keys',async()=>{
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
 });
+
+test('public buyer authorization gives scoped plan IDs but no seller credentials',async()=>{
+ const e=env();await setup(e,{items:{'package-1':1,'package-5':1}});
+ const response=await result(await go(e,'/api/products'));
+ assert.equal(response.status,200);
+ assert.equal(response.body.checkoutEnabled,false);
+ assert.equal(response.body.products.find(p=>p.id==='package-1').paymentPlanId,'plan-package-1');
+ assert.equal(response.body.products.find(p=>p.id==='package-5').paymentPlanId,'plan-package-5');
+ assert.ok(!JSON.stringify(response.body).includes('seller_key_encrypted'));
+ const html=await (await go(e,'/')).text();
+ assert.match(html,/Open Nevermined Buyer Portal/);
+ assert.match(html,/https:\/\/nevermined.app\//);
+ assert.match(html,/Copy Payment Plan ID/);
+ assert.match(html,/cannot mint a buyer token/);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+});
