@@ -381,6 +381,12 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  let settled;
  try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequestId||verify.agentRequest?.agentRequestId);}catch(err){
   const diagnostic=providerDiagnostic(err);
+  if(diagnostic.code==='BCK.STRIPE.0022'){
+   // Provider refused execution because seller Stripe Connect is not charge-enabled.
+   await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code=? WHERE id=? AND status='settling'",diagnostic.code,attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=? AND status='settling'",id)]);
+   await release(env,id);await audit(env,'seller_payment_configuration_blocked',id,JSON.stringify(diagnostic));
+   return json({error:'The seller must complete Stripe Connect setup before accepting payments (BCK.STRIPE.0022). Payment execution was blocked; no key was delivered. Contact the store owner.',charged:false,settlementAttempted:true,providerCode:diagnostic.code},503);
+  }
   // Only this explicit provider code attests a definite decline with no captured charge.
   if(diagnostic.code==='BCK.X402.0049'){
    await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code=? WHERE id=? AND status='settling'",diagnostic.code,attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=? AND status='settling'",id)]);

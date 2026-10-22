@@ -212,3 +212,9 @@ test('unconfirmed settlement receipt does not halt other buyers',async()=>{
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
  mockFacilitator();assert.equal((await purchase(e,'package-1')).charge.status,200);
 });
+
+test('seller Stripe configuration rejection is actionable and releases its uncharged stock',async()=>{
+ const e=env();await setup(e,{items:{'package-1':2}});e.CHECKOUT_ENABLED='true';mockFacilitator();const base=globalThis.fetch;
+ globalThis.fetch=async(url,opt)=>String(url).endsWith('/settle')?Response.json({code:'BCK.STRIPE.0022',correlationId:'request-123'},{status:424}):base(url,opt);
+ const a=await purchase(e,'package-1');assert.equal(a.charge.status,503);assert.equal(a.charge.body.charged,false);assert.equal(a.charge.body.providerCode,'BCK.STRIPE.0022');assert.equal(e.DB.db.prepare('SELECT status FROM payment_attempts').get().status,'failed');assert.equal(e.DB.db.prepare("SELECT count(*) n FROM inventory_reservations WHERE state='reserved'").get().n,0);assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+});
