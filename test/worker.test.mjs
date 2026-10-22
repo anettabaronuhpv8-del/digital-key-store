@@ -115,21 +115,18 @@ test('owner live $1 settlement is denied without separate approval and cannot ch
  assert.equal((await go(e,'/api/orders','POST',{productId:'package-1'})).status,503);
 });
 
-test('owner trial status and Live charge panel remain private and disabled without approval',async()=>{
+test('owner designates buyer, private trial remains locked without approval',async()=>{
  const e=env();const cookie=await setup(e,{items:{'package-1':2}});
- assert.equal((await go(e,'/api/admin/live-test/status')).status,403);
- const response=await result(await go(e,'/api/admin/live-test/status','GET',undefined,undefined,cookie));
- assert.equal(response.status,200);
- assert.equal(response.body.approved,false);
- assert.equal(response.body.checkoutEnabled,false);
- assert.equal(response.body.paymentRecorded,undefined);
+ assert.equal((await go(e,'/api/admin/live-test/invite','POST',{})).status,403);
  const html=await (await go(e,'/admin','GET',undefined,undefined,cookie)).text();
- assert.match(html,/Authorize First Live \$1 Purchase/);
- assert.match(html,/\/api\/admin\/live-test\/charge-once/);
- assert.match(html,/\/api\/admin\/live-test\/status/);
- assert.match(html,/owner-live-charge/);
+ assert.match(html,/Designate First \$1 Buyer/);
+ assert.doesNotMatch(html,/Authorize First Live \$1 Purchase/);
+ const trial=await (await go(e,'/trial')).text();
+ assert.match(trial,/Private \$1 purchase/);
+ assert.match(trial,/\/api\/trial\/charge-once/);
+ assert.equal((await go(e,'/api/trial/status')).status,403);
+ assert.equal((await go(e,'/api/trial/charge-once','POST',{token:keyToken('plan-package-1'),confirm:'CHARGE $1 x'})).status,403);
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
- assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
 });
 
 test('owner recovery cannot deliver or charge an unpaid trial',async()=>{
