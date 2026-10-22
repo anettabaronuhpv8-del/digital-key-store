@@ -1,5 +1,5 @@
 import {json,fail,token,sha,mac,aes,encrypt,decrypt,equal,parseTXT,cents,productId,receiptValid,decodeTokenScope,secureHeaders} from './core.js';
-import {createNevermined,safeError} from './x402.js';
+import {createNevermined,safeError,providerDiagnostic} from './x402.js';
 import {buildPaymentRequiredForOrder,isVerified,settlementEvidence,validatePaygFiatPlan} from './payment-contract.js';
 import {storefront,adminLogin,adminDashboard,buyerTrialPage} from './ui.js';
 const q=(env,sql,...params)=>env.DB.prepare(sql).bind(...params);
@@ -379,7 +379,18 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  if(!isVerified(verify)){await release(env,id);await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code='VERIFY_REJECTED' WHERE id=?",attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=?",id)]);await releasePublicSlot();return fail('Token verification was rejected; no key was delivered.',402);}
  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='settling' WHERE id=? AND status='verifying'",attempt.id),q(env,"UPDATE orders SET status='settling' WHERE id=?",id)]);
  let settled;
- try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequest?.agentRequestId);}catch(err){await q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",safeError(err),attempt.id).run();await q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id).run();await audit(env,'payment_uncertain',id,safeError(err));return fail('Payment result is uncertain. Do not retry this order; contact the store owner.',503);}
+ try{settled=await facilitator.settle(d.token,paymentRequired,credits,verify.agentRequestId||verify.agentRequest?.agentRequestId);}catch(err){
+  const diagnostic=providerDiagnostic(err);
+  // Only this explicit provider code attests a definite decline with no captured charge.
+  if(diagnostic.code==='BCK.X402.0049'){
+   await env.DB.batch([q(env,"UPDATE payment_attempts SET status='failed',error_code=? WHERE id=? AND status='settling'",diagnostic.code,attempt.id),q(env,"UPDATE orders SET status='failed' WHERE id=? AND status='settling'",id)]);
+   await release(env,id);await audit(env,'payment_declined',id,JSON.stringify(diagnostic));
+   return json({error:'Payment provider declined the charge (BCK.X402.0049). No payment was captured. Check your payment method with Nevermined or your card issuer.',charged:false,settlementAttempted:true,providerCode:diagnostic.code},402);
+  }
+  await env.DB.batch([q(env,"UPDATE payment_attempts SET status='uncertain',error_code=? WHERE id=?",diagnostic.code,attempt.id),q(env,"UPDATE orders SET status='uncertain' WHERE id=?",id)]);
+  await audit(env,'payment_uncertain',id,JSON.stringify(diagnostic));
+  return json({error:'Payment result is uncertain ('+diagnostic.code+'). Do not retry this order; contact the store owner.',providerCode:diagnostic.code,correlationId:diagnostic.correlationId,settlementAttempted:true},503);
+ }
  const paymentEvidence=settlementEvidence(settled,credits,order.total_cents,planPrice.ok);
  if(!paymentEvidence){
   // A PAYG fiat settlement must prove success and return a unique PSP charge id
