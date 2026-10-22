@@ -5,7 +5,7 @@ workers_dev = true
 keep_vars = true
 
 [vars]
-CHECKOUT_ENABLED = "false"
+CHECKOUT_ENABLED = "true"
 
 [[d1_databases]]
 binding = "DB"
