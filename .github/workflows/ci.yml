@@ -1,0 +1,23 @@
+name: Digital Key Store Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit-and-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run key-store test suite
+        run: npm test
+      - name: Validate Worker JavaScript modules
+        run: |
+          node --check src/core.js
+          node --check src/x402.js
+          node --check src/worker.js
+          node --check src/ui.js
