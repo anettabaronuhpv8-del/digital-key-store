@@ -50,6 +50,15 @@ async function neverminedAuthProbeOnce(env,fetcher=fetch){
  }
  await setSetting(env,keyName,JSON.stringify(out));return out;
 }
+async function neverminedPlansProbeOnce(env,fetcher=fetch){
+ const name='nvm_plans_probe_once_20261022';const prior=await getSetting(env,name);if(prior)return JSON.parse(prior);
+ const lock=await q(env,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',name,JSON.stringify({category:'IN_PROGRESS'})).run();if(lock.meta.changes!==1)return {category:'ALREADY_RUNNING'};
+ const config=await paymentConfig(env),key=await sellerKey(env);
+ const rows=await q(env,'SELECT p.id,pl.plan_id,pl.credits_per_purchase FROM products p JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.active=1 AND p.deleted_at IS NULL ORDER BY p.price_cents').all();
+ const plans=[];
+ if(config.environment==='live'&&key){for(const p of rows.results){const url='https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id);try{const r=await fetcher(url,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(10000)});let planIdMatches=null,creditsMatch=null;if(r.ok){try{const b=await r.json();planIdMatches=String(b.planId)===String(p.plan_id);creditsMatch=Number(b.creditsConfig?.amount)===Number(p.credits_per_purchase);}catch{}}plans.push({productId:p.id,httpStatus:r.status,planIdMatches,creditsMatch});}catch(e){plans.push({productId:p.id,httpStatus:null,errorCategory:e?.name==='TimeoutError'?'TIMEOUT':'FETCH_ERROR'});}}}
+ const out={readOnly:true,plans};await setSetting(env,name,JSON.stringify(out));return out;
+}
 async function verifyNeverminedConnection(env,fetcher=fetch){
  const config=await paymentConfig(env);
  const key=await sellerKey(env);
@@ -59,7 +68,7 @@ async function verifyNeverminedConnection(env,fetcher=fetch){
  const base='https://api.'+config.environment+'.nevermined.app/api/v1/protocol/';
  async function read(path){
   let response;
-  try{response=await fetcher(base+path,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(12000),redirect:'error'});}catch(err){const category=err?.name==='TimeoutError'||err?.name==='AbortError'?'TIMEOUT':err?.name==='TypeError'?'NETWORK_OR_DNS':'FETCH_ERROR';return {ok:false,error:category,httpStatus:null};}
+  try{response=await fetcher(base+path,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(12000),redirect:'manual'});}catch(err){const category=err?.name==='TimeoutError'||err?.name==='AbortError'?'TIMEOUT':err?.name==='TypeError'?'NETWORK_OR_DNS':'FETCH_ERROR';return {ok:false,error:category,httpStatus:null};}
   if(!response.ok)return {ok:false,httpStatus:response.status,error:response.status===401?'UNAUTHORIZED':response.status===403?'FORBIDDEN':response.status===404?'NOT_FOUND':'HTTP_ERROR'};
   try{const body=await response.json();return {ok:true,body};}catch{return {ok:false,error:'INVALID_RESPONSE',httpStatus:response.status};}
  }
@@ -181,6 +190,7 @@ export default {async fetch(req,env){
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
   if(req.method==='GET'&&path==='/api/health/nevermined-origin')return json(await neverminedOriginProbe());
   if(req.method==='GET'&&path==='/api/health/nevermined-auth-once')return json(await neverminedAuthProbeOnce(env));
+  if(req.method==='GET'&&path==='/api/health/nevermined-plans-once')return json(await neverminedPlansProbeOnce(env));
   if(req.method==='GET'&&path==='/api/products')return catalog(env);
   if(req.method==='POST'&&path==='/api/orders')return startOrder(req,env);
   const m=idFrom(path,/^\/api\/orders\/(dks_[a-f0-9-]{36})$/);
