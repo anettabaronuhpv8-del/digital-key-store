@@ -28,44 +28,6 @@ async function updateProduct(req,env,id){const d=await readJSON(req,5000);if(!aw
 async function deleteProduct(env,id){await q(env,'UPDATE products SET active=0,deleted_at=CURRENT_TIMESTAMP WHERE id=? AND deleted_at IS NULL',id).run();await audit(env,'product_deleted',id);return json({ok:true});}
 async function saveConfig(req,env){const d=await readJSON(req,5000);if(typeof d.agentId!=='string'||d.agentId.length>300||!['sandbox','live'].includes(d.environment)||!['nvm:card-delegation','nvm:erc4337'].includes(d.scheme)||typeof d.network!=='string'||!['stripe','braintree','visa','eip155:84532','eip155:8453'].includes(d.network)||typeof d.sellerKey!=='string'||d.sellerKey.length>1500)return fail('Invalid payment settings');if((d.scheme==='nvm:card-delegation'&&!['stripe','braintree','visa'].includes(d.network))||(d.scheme==='nvm:erc4337'&&!d.network.startsWith('eip155:')))return fail('Scheme and network mismatch');if(d.sellerKey){if(!/^(nvm:|sandbox:|live:)/.test(d.sellerKey))return fail('Invalid Nevermined Seller API Key format');await setSetting(env,'seller_key_encrypted',await encrypt(await aes(env.CONFIG_SECRET),d.sellerKey));}await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','agent_id',d.agentId.trim()),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','environment',d.environment),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','scheme',d.scheme),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','network',d.network)]);await audit(env,'payment_config_updated');return json({ok:true});}
 // Read-only Nevermined connectivity diagnostics. Never returns bearer credentials or raw provider payloads.
-// Fixed-origin read-only probe; no credentials, no user-controlled URL, no provider response body.
-async function neverminedOriginProbe(fetcher=fetch){
- const url='https://api.live.nevermined.app/api/v1/protocol/agents';
- try{const r=await fetcher(url,{method:'GET',headers:{Accept:'application/json'},signal:AbortSignal.timeout(8000),redirect:'manual'});return {ok:true,httpStatus:r.status,category:r.status===401?'UNAUTHORIZED_EXPECTED':r.status===403?'FORBIDDEN':r.status===404?'NOT_FOUND':'HTTP_RESPONSE',host:'api.live.nevermined.app',path:'/api/v1/protocol/agents'};}
- catch(e){const name=String(e?.name||'Error');const causeName=String(e?.cause?.name||'');const category=name==='TimeoutError'||name==='AbortError'?'TIMEOUT':name==='TypeError'?'FETCH_TYPE_ERROR':'FETCH_EXCEPTION';return {ok:false,httpStatus:null,category,errorName:['TypeError','AbortError','TimeoutError','Error'].includes(name)?name:'OTHER',causeCategory:causeName==='Error'?'GENERIC_CAUSE':causeName==='TypeError'?'TYPE_CAUSE':'UNKNOWN_CAUSE',host:'api.live.nevermined.app',path:'/api/v1/protocol/agents'};}
-}
-// One-shot authenticated GET probe; fixed endpoint, no response body or secret disclosure.
-async function neverminedAuthProbeOnce(env,fetcher=fetch){
- const keyName='nvm_auth_probe_once_20261022';
- const previous=await getSetting(env,keyName);
- if(previous)return JSON.parse(previous);
- const lock=await q(env,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',keyName,JSON.stringify({ok:false,category:'IN_PROGRESS'})).run();
- if(lock.meta.changes!==1)return {ok:false,category:'ALREADY_RUNNING'};
- const config=await paymentConfig(env),key=await sellerKey(env);
- let out={ok:false,category:'MISSING_CONFIGURATION'};
- if(config.environment==='live'&&key&&config.agentId){
-  const url='https://api.live.nevermined.app/api/v1/protocol/agents/'+encodeURIComponent(config.agentId);
-  try{const response=await fetcher(url,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(10000)});out={ok:true,httpStatus:response.status,category:response.status>=300&&response.status<400?'REDIRECT':response.status===401?'UNAUTHORIZED':response.status===403?'FORBIDDEN':response.status===404?'NOT_FOUND':response.ok?'HTTP_SUCCESS':'HTTP_ERROR'};}
-  catch(e){const name=String(e?.name||'');out={ok:false,httpStatus:null,category:name==='TimeoutError'||name==='AbortError'?'TIMEOUT':name==='TypeError'?'FETCH_TYPE_ERROR':'FETCH_EXCEPTION',errorName:['TypeError','Error','TimeoutError','AbortError'].includes(name)?name:'OTHER'};}
- }
- await setSetting(env,keyName,JSON.stringify(out));return out;
-}
-async function neverminedPlansProbeOnce(env,fetcher=fetch){
- const name='nvm_plans_probe_once_20261022';const prior=await getSetting(env,name);if(prior)return JSON.parse(prior);
- const lock=await q(env,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',name,JSON.stringify({category:'IN_PROGRESS'})).run();if(lock.meta.changes!==1)return {category:'ALREADY_RUNNING'};
- const config=await paymentConfig(env),key=await sellerKey(env);
- const rows=await q(env,'SELECT p.id,pl.plan_id,pl.credits_per_purchase FROM products p JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.active=1 AND p.deleted_at IS NULL ORDER BY p.price_cents').all();
- const plans=[];
- if(config.environment==='live'&&key){for(const p of rows.results){const url='https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id);try{const r=await fetcher(url,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(10000)});let planIdMatches=null,creditsMatch=null;if(r.ok){try{const b=await r.json();planIdMatches=String(b.planId)===String(p.plan_id);creditsMatch=Number(b.creditsConfig?.amount)===Number(p.credits_per_purchase);}catch{}}plans.push({productId:p.id,httpStatus:r.status,planIdMatches,creditsMatch});}catch(e){plans.push({productId:p.id,httpStatus:null,errorCategory:e?.name==='TimeoutError'?'TIMEOUT':'FETCH_ERROR'});}}}
- const out={readOnly:true,plans};await setSetting(env,name,JSON.stringify(out));return out;
-}
-async function neverminedPlanShapeOnce(env,fetcher=fetch){
- const name='nvm_shape_once_20261022';const prev=await getSetting(env,name);if(prev)return JSON.parse(prev);
- const lock=await q(env,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',name,'{}').run();if(lock.meta.changes!==1)return {error:'ALREADY_RUNNING'};
- const key=await sellerKey(env);const p=await q(env,'SELECT plan_id FROM product_payment_plans WHERE product_id=?','package-1').first();let out={error:'MISSING_CONFIGURATION'};
- if(key&&p?.plan_id){try{const r=await fetcher('https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id),{headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(10000)});const b=await r.json();const shape=o=>o&&typeof o==='object'?Object.fromEntries(Object.entries(o).map(([k,v])=>[k,v&&typeof v==='object'?(Array.isArray(v)?'array':Object.keys(v).slice(0,16)) : typeof v])):{};out={status:r.status,shape:shape(b)};}catch(e){out={error:e?.name==='TimeoutError'?'TIMEOUT':'FETCH_OR_PARSE_ERROR'}}}
- await setSetting(env,name,JSON.stringify(out));return out;
-}
 async function verifyNeverminedConnection(env,fetcher=fetch){
  const config=await paymentConfig(env);
  const key=await sellerKey(env);
@@ -93,10 +55,11 @@ async function verifyNeverminedConnection(env,fetcher=fetch){
   const linked=associated?associated.has(String(p.plan_id)):null;
   // The public plan schema does not provide an authoritative fiat USD per-request price.
   // Never infer a USD conversion from token amounts or the configured credit count.
-  const planIdMatches=String(b.planId)===String(p.plan_id);
-  const reportedCredits=Number.isSafeInteger(Number(credits.amount))?Number(credits.amount):null;
+  const planIdMatches=String(b.planId??b.id??'')===String(p.plan_id);
+  const creditRaw=credits.amount??b.registry?.credits;
+  const reportedCredits=creditRaw!==undefined&&creditRaw!==null&&Number.isSafeInteger(Number(creditRaw))?Number(creditRaw):null;
   const creditsMatch=reportedCredits!==null&&reportedCredits===Number(p.credits_per_purchase);
-  plans.push({productId:p.id,ok:planIdMatches&&linked===true,planIdMatches,linkedToAgent:linked,expectedUsdCents:p.price_cents,currency:p.currency,creditsPerRequest:p.credits_per_purchase,planCreditAmount:reportedCredits,creditsMatch,priceType:typeof price.priceType==='string'?price.priceType:null,fiatUsdPriceVerified:false,networkVerified:false,schemeVerified:false,priceVerification:'UNVERIFIED_PROVIDER_METADATA'});
+  plans.push({productId:p.id,ok:planIdMatches&&linked===true,planIdMatches,linkedToAgent:linked,expectedUsdCents:p.price_cents,currency:p.currency,creditsPerRequest:p.credits_per_purchase,planCreditAmount:reportedCredits,creditsMatch,priceType:typeof price.priceType==='string'?price.priceType:typeof b.billingModel==='string'?b.billingModel:null,providerSchema:b.metadata&&b.registry?'LEGACY_REGISTRY':'API_REFERENCE',fiatUsdPriceVerified:false,networkVerified:false,schemeVerified:false,priceVerification:'UNVERIFIED_PROVIDER_METADATA'});
  }
  return {ok:agentResponse.ok&&plans.every(p=>p.ok),keyPrefixCategory:keyEnvironment,keyEnvironmentMismatch:(keyEnvironment==='live'||keyEnvironment==='sandbox')&&keyEnvironment!==config.environment,environment:config.environment,schemeConfigured:config.scheme,networkConfigured:config.network,agentReachable:agentResponse.ok,agentError:agentResponse.ok?null:agentResponse.error,agentHttpStatus:agentResponse.httpStatus??null,agentPlansError:agentPlansResponse.ok?null:agentPlansResponse.error,agentPlansHttpStatus:agentPlansResponse.httpStatus??null,plans,checkoutEnabled:env.CHECKOUT_ENABLED==='true',readOnly:true};
 }
@@ -195,10 +158,10 @@ export default {async fetch(req,env){
   if(!noCrossSite(req))return fail('Cross-origin requests are not permitted',403);
   if(req.method==='GET'&&path==='/')return page(storefront());
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
-  if(req.method==='GET'&&path==='/api/health/nevermined-origin')return json(await neverminedOriginProbe());
-  if(req.method==='GET'&&path==='/api/health/nevermined-auth-once')return json(await neverminedAuthProbeOnce(env));
-  if(req.method==='GET'&&path==='/api/health/nevermined-plans-once')return json(await neverminedPlansProbeOnce(env));
-  if(req.method==='GET'&&path==='/api/health/nevermined-plan-shape-once')return json(await neverminedPlanShapeOnce(env));
+
+
+
+
   if(req.method==='GET'&&path==='/api/products')return catalog(env);
   if(req.method==='POST'&&path==='/api/orders')return startOrder(req,env);
   const m=idFrom(path,/^\/api\/orders\/(dks_[a-f0-9-]{36})$/);
