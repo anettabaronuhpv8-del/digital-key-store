@@ -11,6 +11,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Generate lockfile and clean-install dependencies
+        run: |
+          npm install --package-lock-only --no-audit --no-fund
+          npm ci --no-audit --no-fund
+      - name: Run complete tests from a clean dependency install
+        run: npm test
       - name: Zip exact production source without .git
         run: |
           zip -q -r master-source.zip . -x '.git/*' '*node_modules/*' '.env*' '*.log'
