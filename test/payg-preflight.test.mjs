@@ -1,4 +1,41 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';import {createNevermined} from '../src/x402.js';
-test('x402 verify is non-settling and asks for one redemption unit',async()=>{const calls=[];const client=createNevermined({NVM_API_KEY:'synthetic',NVM_ENV:'live'},async(url,opts)=>{calls.push({url,body:JSON.parse(opts.body),method:opts.method});return Response.json({valid:true,remainingCredits:2,permissionHash:'permission'})});await client.verify('synthetic-token','synthetic-agent',1);assert.equal(calls.length,1);assert.match(calls[0].url,/\/x402\/verify$/);assert.deepEqual(calls[0].body,{accessToken:'synthetic-token',agentId:'synthetic-agent',creditsRequested:1});assert.equal(calls[0].method,'POST')});
-test('independent orders use independent settlement metadata',async()=>{const calls=[];const client=createNevermined({NVM_API_KEY:'synthetic',NVM_ENV:'live'},async(url,opts)=>{calls.push({url,body:JSON.parse(opts.body)});return Response.json({success:true,creditsSettled:1,txHash:'unique-transaction',permissionHash:'permission'})});await client.settle('reusable-v2-token','agent',1,'order-a');await client.settle('reusable-v2-token','agent',1,'order-b');assert.equal(calls.length,2);assert.deepEqual(calls.map(x=>x.body.requestMetadata.orderId),['order-a','order-b']);assert.ok(calls.every(x=>x.body.creditsUsed===1));assert.ok(calls.every(x=>x.url.endsWith('/x402/settle')))});
-test('storefront includes token field and checkout lock',()=>{const ui=readFileSync(new URL('../src/ui.js',import.meta.url),'utf8');const worker=readFileSync(new URL('../src/worker.js',import.meta.url),'utf8');assert.ok(ui.includes('payment-token'));assert.match(ui,/x402 v2 token/);assert.match(worker,/CHECKOUT_ENABLED!=='true'/)});
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {createNevermined} from '../src/x402.js';
+import {buildPaymentRequiredForOrder,settlementEvidence,isVerified} from '../src/payment-contract.js';
+
+const requirement=buildPaymentRequiredForOrder({planId:'plan-one',agentId:'agent-one',scheme:'nvm:card-delegation',network:'stripe',resourceUrl:'https://store.example/api/orders/charge'});
+test('verify uses old QC Agent SDK-compatible paymentRequired and never charges',async()=>{
+ const calls=[];
+ const client=createNevermined({NVM_API_KEY:'synthetic',NVM_ENV:'live'},async(url,opts)=>{calls.push({url,body:JSON.parse(opts.body),method:opts.method});return Response.json({isValid:true,agentRequest:{agentRequestId:'r123'}})});
+ const response=await client.verify('synthetic-token',requirement,1);
+ assert.equal(isVerified(response),true);
+ assert.equal(calls.length,1);
+ assert.match(calls[0].url,/\/x402\/verify$/);
+ assert.deepEqual(calls[0].body,{paymentRequired:requirement,x402AccessToken:'synthetic-token',maxAmount:'1'});
+ assert.equal(calls[0].method,'POST');
+});
+test('independent orders carry distinct verification request ID; no token replay prohibition',async()=>{
+ const calls=[];
+ const client=createNevermined({NVM_API_KEY:'synthetic',NVM_ENV:'live'},async(url,opts)=>{calls.push({url,body:JSON.parse(opts.body)});return Response.json({success:true,billingModel:'pay-as-you-go',orderTx:{id:'tx_'+calls.length+'abcdef',amountCents:100,currency:'USD'}})});
+ await client.settle('reusable-v2-token',requirement,1,'agentRequest-order-a');
+ await client.settle('reusable-v2-token',requirement,1,'agentRequest-order-b');
+ assert.equal(calls.length,2);
+ assert.deepEqual(calls.map(x=>x.body.agentRequestId),['agentRequest-order-a','agentRequest-order-b']);
+ assert.ok(calls.every(x=>x.body.maxAmount==='1'));
+ assert.ok(calls.every(x=>x.body.x402AccessToken==='reusable-v2-token'));
+ assert.ok(calls.every(x=>x.url.endsWith('/x402/settle')));
+});
+test('PAYG receipt requires independent transaction and authoritative fiat amount for key delivery',()=>{
+ assert.equal(settlementEvidence({success:true,billingModel:'pay-as-you-go',orderTx:{id:'tx_123456',amountCents:100,currency:'USD'}},1,100)?.amountVerified,true);
+ assert.equal(settlementEvidence({success:true,billingModel:'pay-as-you-go',orderTx:{id:'tx_123456'}},1,100)?.amountVerified,false);
+ assert.equal(settlementEvidence({success:true,billingModel:'pay-as-you-go',orderTx:{id:'tx_123456',amountCents:200,currency:'USD'}},1,100)?.amountVerified,false);
+ assert.equal(settlementEvidence({success:true,creditsSettled:1,txHash:'fake'},1,100),null);
+});
+test('storefront includes token field and checkout lock',()=>{
+ const ui=readFileSync(new URL('../src/ui.js',import.meta.url),'utf8');
+ const worker=readFileSync(new URL('../src/worker.js',import.meta.url),'utf8');
+ assert.ok(ui.includes('payment-token'));
+ assert.match(ui,/x402 v2 token/);
+ assert.match(worker,/CHECKOUT_ENABLED!=='true'/);
+});
