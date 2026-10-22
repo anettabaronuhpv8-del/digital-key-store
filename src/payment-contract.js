@@ -5,19 +5,18 @@ export function buildPaymentRequiredForOrder({planId,agentId,scheme='nvm:card-de
   return {x402Version:2,error:'Payment required',resource:{url:resourceUrl,description:'One digital key purchase',mimeType:'application/json'},accepts:[{scheme,network,planId,extra:{version:'1',agentId}}],extensions:{}};
 }
 export function isVerified(v){return v?.isValid===true;}
-export function settlementEvidence(s,requiredUnits=1){
-  if(s?.success!==true)return null;
-  const payg=s.billingModel==='pay-as-you-go';
-  if(payg){
-    const transaction=s.orderTx??s.transaction;
-    // PAYG is a fiat order, not a credit burn. Do not treat creditsSettled as proof.
-    if(!transaction || (typeof transaction!=='string'&&typeof transaction!=='object'))return null;
-    const transactionId=typeof transaction==='string'?transaction:(transaction.id??transaction.txHash??transaction.transactionId);
-    if(typeof transactionId!=='string'||transactionId.length<6)return null;
-    return {providerTransactionId:transactionId,billingModel:'pay-as-you-go',settlementUnits:requiredUnits,confirmedUsdCents:null,amountVerified:false};
-  }
-  // Credits plans are not authorized on this PAYG-only store.
-  return null;
+export function settlementEvidence(s,requiredUnits=1,expectedCents=null){
+  if(s?.success!==true || s.billingModel!=='pay-as-you-go')return null;
+  const transaction=s.orderTx??s.transaction;
+  if(!transaction || (typeof transaction!=='string'&&typeof transaction!=='object'))return null;
+  const transactionId=typeof transaction==='string'?transaction:(transaction.id??transaction.txHash??transaction.transactionId);
+  if(typeof transactionId!=='string'||transactionId.length<6)return null;
+  // For PAYG, a credit count is NOT a USD amount. Trust a receipt amount only
+  // when the facilitator explicitly attests to both its currency and cents.
+  const attestedCents=typeof transaction==='object'?transaction.amountCents:undefined;
+  const attestedCurrency=typeof transaction==='object'?transaction.currency:undefined;
+  const amountVerified=Number.isSafeInteger(expectedCents)&&expectedCents>0&&Number.isSafeInteger(attestedCents)&&attestedCents===expectedCents&&attestedCurrency==='USD';
+  return {providerTransactionId:transactionId,billingModel:'pay-as-you-go',settlementUnits:requiredUnits,confirmedUsdCents:amountVerified?attestedCents:null,amountVerified};
 }
 export function safeProviderCode(err){
  const code=String(err?.code??'');
