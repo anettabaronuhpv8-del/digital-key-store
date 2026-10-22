@@ -1,0 +1,8 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {parseTXT,token,sha,mac,aes,encrypt,decrypt,receiptValid,decodeTokenScope,b64} from '../src/core.js';
+test('TXT ignores whitespace and deduplicates',()=>{const x=parseTXT('AAA\nAAA\nBBB\n\n');assert.deepEqual(x.keys,['AAA','BBB']);assert.equal(x.duplicates,1);});
+test('TXT rejects control characters and oversized keys',()=>{const x=parseTXT('X\u0000Y\n'+'x'.repeat(513));assert.equal(x.invalid,2);});
+test('cryptographic random order tokens and digests differ',async()=>{const a=token(),b=token();assert.notEqual(a,b);assert.notEqual(await sha(a),await sha(b));});
+test('HMAC fingerprints deterministic and keyed',async()=>assert.notEqual(await mac('alpha','key'),await mac('beta','key')));
+test('AES-GCM encrypt decrypt works',async()=>{const k=await aes('long-secret-32-bytes-abcdefghijklmnopqrstuvwxyz');const e=await encrypt(k,'KEY-TEST-123');assert.ok(!e.includes('KEY-TEST'));assert.equal(await decrypt(k,e),'KEY-TEST-123');});
+test('receipt requires confirmed settlement and exact credits',()=>{const s={success:true,creditsSettled:100,txHash:'tx-012345678901',permissionHash:'permission1'};assert.ok(receiptValid(s,100));assert.equal(receiptValid(s,200),false);assert.equal(receiptValid({...s,success:false},100),false);assert.equal(receiptValid({...s,txHash:''},100),false);});
+test('scope requires x402 v2 accepted plan',()=>{const t='x402_'+b64(new TextEncoder().encode(JSON.stringify({x402Version:2,accepted:{planId:'p1'}})));assert.equal(decodeTokenScope(t)?.planId,'p1');assert.equal(decodeTokenScope('broken'),null);});
