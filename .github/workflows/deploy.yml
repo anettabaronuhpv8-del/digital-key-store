@@ -58,6 +58,14 @@ jobs:
             const d=await r.json();
             console.log("Sanitized authenticated Nevermined GET:",JSON.stringify(d));
           '
+      - name: One-shot four-plan authenticated read-only check
+        run: |
+          node --input-type=module -e '
+            const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/nevermined-plans-once";
+            const r=await fetch(u,{signal:AbortSignal.timeout(60000)});
+            if(!r.ok)throw Error("Plan diagnostic HTTP "+r.status);
+            console.log("Sanitized Nevermined Live plans:",JSON.stringify(await r.json()));
+          '
       - name: Verify public health and checkout lock
         run: |
           node --input-type=module -e '
