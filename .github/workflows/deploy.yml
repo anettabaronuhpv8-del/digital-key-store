@@ -47,6 +47,13 @@ jobs:
             if(!r.ok)throw Error("Metadata probe unavailable "+r.status);
             console.log("Sanitized PAYG plan metadata:",JSON.stringify(await r.json()));
           '
+      - name: One-shot PAYG registry fields (read-only)
+        run: |
+          node --input-type=module -e '
+            const r=await fetch("https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/payg-registry-once",{signal:AbortSignal.timeout(60000)});
+            if(!r.ok)throw Error("Registry probe unavailable "+r.status);
+            console.log("Sanitized PAYG registry fields:",JSON.stringify(await r.json()));
+          '
       - name: Verify public health and checkout lock
         run: |
           node --input-type=module -e '
