@@ -59,6 +59,13 @@ async function neverminedPlansProbeOnce(env,fetcher=fetch){
  if(config.environment==='live'&&key){for(const p of rows.results){const url='https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id);try{const r=await fetcher(url,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(10000)});let planIdMatches=null,creditsMatch=null;if(r.ok){try{const b=await r.json();planIdMatches=String(b.planId)===String(p.plan_id);creditsMatch=Number(b.creditsConfig?.amount)===Number(p.credits_per_purchase);}catch{}}plans.push({productId:p.id,httpStatus:r.status,planIdMatches,creditsMatch});}catch(e){plans.push({productId:p.id,httpStatus:null,errorCategory:e?.name==='TimeoutError'?'TIMEOUT':'FETCH_ERROR'});}}}
  const out={readOnly:true,plans};await setSetting(env,name,JSON.stringify(out));return out;
 }
+async function neverminedPlanShapeOnce(env,fetcher=fetch){
+ const name='nvm_shape_once_20261022';const prev=await getSetting(env,name);if(prev)return JSON.parse(prev);
+ const lock=await q(env,'INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',name,'{}').run();if(lock.meta.changes!==1)return {error:'ALREADY_RUNNING'};
+ const key=await sellerKey(env);const p=await q(env,'SELECT plan_id FROM product_payment_plans WHERE product_id=?','package-1').first();let out={error:'MISSING_CONFIGURATION'};
+ if(key&&p?.plan_id){try{const r=await fetcher('https://api.live.nevermined.app/api/v1/protocol/plans/'+encodeURIComponent(p.plan_id),{headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(10000)});const b=await r.json();const shape=o=>o&&typeof o==='object'?Object.fromEntries(Object.entries(o).map(([k,v])=>[k,v&&typeof v==='object'?(Array.isArray(v)?'array':Object.keys(v).slice(0,16)) : typeof v])):{};out={status:r.status,shape:shape(b)};}catch(e){out={error:e?.name==='TimeoutError'?'TIMEOUT':'FETCH_OR_PARSE_ERROR'}}}
+ await setSetting(env,name,JSON.stringify(out));return out;
+}
 async function verifyNeverminedConnection(env,fetcher=fetch){
  const config=await paymentConfig(env);
  const key=await sellerKey(env);
@@ -191,6 +198,7 @@ export default {async fetch(req,env){
   if(req.method==='GET'&&path==='/api/health/nevermined-origin')return json(await neverminedOriginProbe());
   if(req.method==='GET'&&path==='/api/health/nevermined-auth-once')return json(await neverminedAuthProbeOnce(env));
   if(req.method==='GET'&&path==='/api/health/nevermined-plans-once')return json(await neverminedPlansProbeOnce(env));
+  if(req.method==='GET'&&path==='/api/health/nevermined-plan-shape-once')return json(await neverminedPlanShapeOnce(env));
   if(req.method==='GET'&&path==='/api/products')return catalog(env);
   if(req.method==='POST'&&path==='/api/orders')return startOrder(req,env);
   const m=idFrom(path,/^\/api\/orders\/(dks_[a-f0-9-]{36})$/);
