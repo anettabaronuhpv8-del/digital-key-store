@@ -182,3 +182,15 @@ test('manual delivery cannot allocate unpaid inventory or deliver twice',async()
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
  assert.equal(e.DB.db.prepare("SELECT count(*) n FROM inventory WHERE status='sold'").get().n,0);
 });
+
+test('provider verification rejection releases stock and public checkout without settling',async()=>{
+ const e=env();await setup(e,{items:{'package-1':2}});e.CHECKOUT_ENABLED='true';mockFacilitator();
+ const base=globalThis.fetch;let settlements=0;
+ globalThis.fetch=async(url,opt)=>{if(String(url).endsWith('/verify'))return Response.json({code:'BCK.X402.0060'},{status:402});if(String(url).endsWith('/settle'))settlements++;return base(url,opt);};
+ const a=await purchase(e,'package-1');assert.equal(a.charge.status,402);assert.equal(a.charge.body.settlementAttempted,false);assert.equal(settlements,0);
+ assert.equal(e.DB.db.prepare('SELECT status FROM payment_attempts').get().status,'failed');
+ assert.equal(e.DB.db.prepare("SELECT count(*) n FROM inventory_reservations WHERE state='reserved'").get().n,0);
+ assert.equal(e.DB.db.prepare("SELECT count(*) n FROM settings WHERE key IN ('public_settlement_slot','checkout_emergency_halt')").get().n,0);
+ assert.equal((await result(await go(e,'/api/products'))).body.checkoutEnabled,true);
+ mockFacilitator();assert.equal((await purchase(e,'package-1')).charge.status,200);
+});
