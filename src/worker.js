@@ -302,11 +302,12 @@ async function chargeFirstOwnerTrial(req,env){
  return chargeOrder(internal,env,id,true);
 }
 async function chargeOrder(req,env,id,ownerTrial=false){
- if(!ownerTrial&&(env.CHECKOUT_ENABLED!=='true'||await checkoutHalted(env)))return fail('Checkout is not enabled',503);
+ if(!ownerTrial&&env.CHECKOUT_ENABLED!=='true')return fail('Checkout is not enabled',503);
  const order=await orderSecret(req,env,id);if(!order)return fail('Not found',404);
  if(['settled','delivered'].includes(order.status))return statusOrder(req,env,id);
  const attempt=await q(env,'SELECT * FROM payment_attempts WHERE order_id=?',id).first();
  if(!attempt||attempt.status!=='created')return fail('Order is already being processed or requires reconciliation. Never pay the same order twice.',409);
+ if(!ownerTrial&&await checkoutHalted(env))return fail('Checkout temporarily suspended pending reconciliation',503);
  const d=await readJSON(req,10000);if(typeof d.token!=='string'||d.token.length>8000||d.token.length<8)return fail('Invalid token',402);
  const scope=decodeTokenScope(d.token);if(!scope||scope.planId!==attempt.plan_id)return fail('This token is not authorized for this package Payment Plan',402);
  const config=await paymentConfig(env);if(!config.agentId||scope.agentId&&scope.agentId!==config.agentId||scope.scheme!==config.scheme||scope.network!==config.network)return fail('Token Agent, payment scheme or network mismatch',402);
