@@ -189,6 +189,18 @@ async function ownerTrialStatus(env){
  if(attempt?.receipt_json){try{const r=JSON.parse(attempt.receipt_json);receipt={providerTransactionId:r.providerTransactionId||null,amountVerified:r.amountVerified===true||Number.isSafeInteger(r.confirmedUsdCents),confirmedUsdCents:Number.isSafeInteger(r.confirmedUsdCents)?r.confirmedUsdCents:null};}catch{}}
  return json({prepared:Boolean(order),orderId:id,packageId:'package-1',priceCents:order?.total_cents??null,currency:order?.currency??null,planId:attempt?.plan_id??null,redemptionUnits:attempt?.credits_requested??null,orderStatus:order?.status??null,attemptStatus:attempt?.status??null,errorCode:attempt?.error_code??null,settlementAttemptClaimed:claim===id,approved:env.OWNER_LIVE_TEST_APPROVED==='true',checkoutEnabled:env.CHECKOUT_ENABLED==='true',paymentRecorded:Boolean(payment),paymentStatus:payment?.status??null,providerTransactionId:payment?.provider_payment_id??receipt?.providerTransactionId??null,usdReconciled:Boolean(payment&&payment.status==='settled'&&payment.currency==='USD'&&payment.amount_cents===order?.total_cents),deliveredKeys:Number(delivery?.n||0),receipt});
 }
+// Recovery never invokes the facilitator. It may fulfill only a D1-confirmed paid order.
+async function recoverFirstOwnerTrial(env){
+ const id=await getSetting(env,'owner_first_live_test_order_id');
+ if(!id)return fail('Owner test order not found',404);
+ const order=await q(env,'SELECT status,total_cents,currency FROM orders WHERE id=?',id).first();
+ const attempt=await q(env,'SELECT status FROM payment_attempts WHERE order_id=?',id).first();
+ const payment=await q(env,"SELECT status,amount_cents,currency FROM payments WHERE order_id=? AND provider='nevermined'",id).first();
+ if(!order||!attempt||!payment||payment.status!=='settled'||payment.amount_cents!==100||payment.currency!=='USD'||order.total_cents!==100||!['settled','delivered'].includes(order.status)||attempt.status!=='settled')return json({orderId:id,recovered:false,reason:'PAYMENT_RECONCILIATION_REQUIRED',charged:false,settlementRetried:false},409);
+ const key=await fulfill(env,id);
+ const delivered=await q(env,'SELECT COUNT(*) n FROM deliveries WHERE order_id=?',id).first();
+ return json({orderId:id,recovered:Boolean(key)&&Number(delivered?.n)===1,deliveredKeys:Number(delivered?.n||0),charged:false,settlementRetried:false});
+}
 async function chargeFirstOwnerTrial(req,env){
  if(env.CHECKOUT_ENABLED==='true'||env.OWNER_LIVE_TEST_APPROVED!=='true')return fail('Owner Live test is not authorized',403);
  const id=await getSetting(env,'owner_first_live_test_order_id');
@@ -286,6 +298,7 @@ export default {async fetch(req,env){
    if(req.method==='POST'&&path==='/api/admin/logout')return json({ok:true},200,{'Set-Cookie':cookie('',0)});
    if(req.method==='GET'&&path==='/api/admin/dashboard')return dashboard(env);
    if(req.method==='GET'&&path==='/api/admin/live-test/status')return ownerTrialStatus(env);
+   if(req.method==='POST'&&path==='/api/admin/live-test/recover')return recoverFirstOwnerTrial(env);
    if(req.method==='POST'&&path==='/api/admin/live-test/prepare')return prepareFirstOwnerTest(req,env);
    if(req.method==='POST'&&path==='/api/admin/live-test/verify-token')return verifyFirstOwnerToken(req,env);
    if(req.method==='POST'&&path==='/api/admin/live-test/charge-once')return chargeFirstOwnerTrial(req,env);
