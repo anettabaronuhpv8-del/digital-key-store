@@ -40,40 +40,6 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx wrangler deploy --keep-vars
-      - name: Probe Nevermined origin from deployed Worker (read-only, no credentials)
-        run: |
-          node --input-type=module -e '
-            const url="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/nevermined-origin";
-            const r=await fetch(url,{signal:AbortSignal.timeout(15000)});
-            if(!r.ok)throw Error("Worker diagnostic route unavailable: HTTP "+r.status);
-            const d=await r.json();
-            console.log("Nevermined origin diagnostic:",JSON.stringify(d));
-          '
-      - name: One-shot authenticated Nevermined GET diagnostic (no charge)
-        run: |
-          node --input-type=module -e '
-            const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/nevermined-auth-once";
-            const r=await fetch(u,{signal:AbortSignal.timeout(15000)});
-            if(!r.ok)throw Error("Diagnostic unavailable HTTP "+r.status);
-            const d=await r.json();
-            console.log("Sanitized authenticated Nevermined GET:",JSON.stringify(d));
-          '
-      - name: One-shot four-plan authenticated read-only check
-        run: |
-          node --input-type=module -e '
-            const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/nevermined-plans-once";
-            const r=await fetch(u,{signal:AbortSignal.timeout(60000)});
-            if(!r.ok)throw Error("Plan diagnostic HTTP "+r.status);
-            console.log("Sanitized Nevermined Live plans:",JSON.stringify(await r.json()));
-          '
-      - name: One-shot Nevermined plan response shape (field names only)
-        run: |
-          node --input-type=module -e '
-            const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/health/nevermined-plan-shape-once";
-            const r=await fetch(u,{signal:AbortSignal.timeout(20000)});
-            if(!r.ok)throw Error("Shape diagnostic HTTP "+r.status);
-            console.log("Nevermined response field shape:",JSON.stringify(await r.json()));
-          '
       - name: Verify public health and checkout lock
         run: |
           node --input-type=module -e '
