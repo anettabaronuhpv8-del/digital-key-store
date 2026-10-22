@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {createNevermined} from '../src/x402.js';
-import {buildPaymentRequiredForOrder,settlementEvidence,isVerified} from '../src/payment-contract.js';
+import {buildPaymentRequiredForOrder,settlementEvidence,isVerified,validatePaygFiatPlan} from '../src/payment-contract.js';
 
 const requirement=buildPaymentRequiredForOrder({planId:'plan-one',agentId:'agent-one',scheme:'nvm:card-delegation',network:'stripe',resourceUrl:'https://store.example/api/orders/charge'});
 test('verify uses old QC Agent SDK-compatible paymentRequired and never charges',async()=>{
@@ -26,11 +26,22 @@ test('independent orders carry distinct verification request ID; no token replay
  assert.ok(calls.every(x=>x.body.x402AccessToken==='reusable-v2-token'));
  assert.ok(calls.every(x=>x.url.endsWith('/x402/settle')));
 });
-test('PAYG receipt requires independent transaction and authoritative fiat amount for key delivery',()=>{
- assert.equal(settlementEvidence({success:true,billingModel:'pay-as-you-go',orderTx:{id:'tx_123456',amountCents:100,currency:'USD'}},1,100)?.amountVerified,true);
- assert.equal(settlementEvidence({success:true,billingModel:'pay-as-you-go',orderTx:{id:'tx_123456'}},1,100)?.amountVerified,false);
- assert.equal(settlementEvidence({success:true,billingModel:'pay-as-you-go',orderTx:{id:'tx_123456',amountCents:200,currency:'USD'}},1,100)?.amountVerified,false);
- assert.equal(settlementEvidence({success:true,creditsSettled:1,txHash:'fake'},1,100),null);
+test('Nevermined registered fiat gross Plan price is sum of 6-decimal receiver shares',()=>{
+ const mk=(c)=>({id:'plan-test',billingModel:'pay-as-you-go',metadata:{plan:{currency:'USD',fiatPaymentProvider:'stripe',x402Scheme:'nvm:card-delegation',priceId:'price_synthetic'}},registry:{price:{amounts:[String(c*9800),String(c*200)]},credits:{amount:'1'}}});
+ for(const cents of [100,200,300,500])assert.equal(validatePaygFiatPlan(mk(cents),'plan-test',cents,1).ok,true);
+ assert.equal(validatePaygFiatPlan(mk(200),'plan-test',100,1).ok,false);
+ assert.equal(validatePaygFiatPlan(mk(100),'wrong-plan',100,1).ok,false);
+ assert.equal(validatePaygFiatPlan({...mk(100),billingModel:'credits'},'plan-test',100,1).ok,false);
+});
+test('official PAYG settle receipt uses Stripe PaymentIntent string and never claims actual USD amount',()=>{
+ const receipt={success:true,billingModel:'pay-as-you-go',network:'stripe',creditsRedeemed:'0',orderTx:'pi_example123456'};
+ const result=settlementEvidence(receipt,1,100,true);
+ assert.equal(result.providerTransactionId,'pi_example123456');
+ assert.equal(result.planPriceVerified,true);
+ assert.equal(result.actualChargeAmountVerified,false);
+ assert.equal(settlementEvidence(receipt,1,100,false),null);
+ assert.equal(settlementEvidence({...receipt,orderTx:''},1,100,true),null);
+ assert.equal(settlementEvidence({...receipt,network:'eip155:8453'},1,100,true),null);
 });
 test('storefront includes token field and checkout lock',()=>{
  const ui=readFileSync(new URL('../src/ui.js',import.meta.url),'utf8');
