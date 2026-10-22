@@ -57,3 +57,12 @@ test('owner can prepare exactly one $1 Live test without charging, enabling chec
  assert.equal((await go(e,'/api/orders','POST',{productId:'package-1'})).status,503);
  assert.equal((await go(e,'/api/orders/'+first.body.orderId+'/charge','POST',{token:keyToken('plan-package-1')},first.body.deliveryToken)).status,503);
 });
+
+test('owner-only token verification cannot settle or deliver keys',async()=>{
+ const e=env();const cookie=await setup(e,{items:{'package-1':2}});
+ const endpoint='/api/admin/live-test/verify-token';
+ assert.equal((await go(e,endpoint,'POST',{token:keyToken('plan-package-1')})).status,403);
+ assert.equal((await go(e,endpoint,'POST',{token:keyToken('plan-package-1')},undefined,cookie)).status,409);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
+});
