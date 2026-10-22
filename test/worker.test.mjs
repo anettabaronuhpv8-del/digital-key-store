@@ -101,3 +101,16 @@ test('reused provider transaction receipt cannot deliver a second key',async()=>
   assert.equal(e.DB.db.prepare("SELECT count(*) n FROM payment_attempts WHERE status='uncertain'").get().n,1);
  }finally{globalThis.fetch=original;}
 });
+
+test('owner live $1 settlement is denied without separate approval and cannot charge publicly',async()=>{
+ const e=env();const cookie=await setup(e,{items:{'package-1':2}});
+ const path='/api/admin/live-test/charge-once';
+ const payload={token:keyToken('plan-package-1'),confirm:'CHARGE $1 dks_4d744078-5705-4704-8647-22f1c675c4ca'};
+ assert.equal((await go(e,path,'POST',payload)).status,403);
+ assert.equal((await go(e,path,'POST',payload,undefined,cookie)).status,403);
+ e.OWNER_LIVE_TEST_APPROVED='true';
+ assert.equal((await go(e,path,'POST',payload,undefined,cookie)).status,409);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
+ assert.equal((await go(e,'/api/orders','POST',{productId:'package-1'})).status,503);
+});
