@@ -50,3 +50,12 @@ jobs:
             if(data.ok!==true||data.checkoutEnabled!==false)throw Error("Worker health or checkout lock invalid");
             console.log("Production health passed; checkout remains disabled.");
           '
+      - name: Inspect official PAYG Plan fiat metadata (read-only)
+        run: |
+          node --input-type=module -e '
+            const u="https://digital-key-store.anettabaronuhpv8.workers.dev/api/_official-plan-price-probe";
+            const r=await fetch(u,{headers:{"Cache-Control":"no-cache"}});
+            const d=await r.json();
+            if(!r.ok||!d.ok)throw Error("Provider plan read-only metadata probe failed");
+            console.log("NEVERMINED_PRICE_PROBE="+JSON.stringify(d));
+          '
