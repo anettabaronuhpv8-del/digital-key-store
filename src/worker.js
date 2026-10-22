@@ -1,7 +1,7 @@
 import {json,fail,token,sha,mac,aes,encrypt,decrypt,equal,parseTXT,cents,productId,receiptValid,decodeTokenScope,secureHeaders} from './core.js';
 import {createNevermined,safeError} from './x402.js';
 import {buildPaymentRequiredForOrder,isVerified,settlementEvidence} from './payment-contract.js';
-import {storefront,adminLogin,adminDashboard} from './ui.js';
+import {storefront,adminLogin,adminDashboard,buyerTrialPage} from './ui.js';
 const q=(env,sql,...params)=>env.DB.prepare(sql).bind(...params);
 const own=(r)=>new URL(r.url).origin;
 const noCrossSite=(r)=>!['POST','PUT','PATCH','DELETE'].includes(r.method)||r.headers.get('Origin')===own(r);
@@ -201,6 +201,51 @@ async function recoverFirstOwnerTrial(env){
  const delivered=await q(env,'SELECT COUNT(*) n FROM deliveries WHERE order_id=?',id).first();
  return json({orderId:id,recovered:Boolean(key)&&Number(delivered?.n)===1,deliveredKeys:Number(delivered?.n||0),charged:false,settlementRetried:false});
 }
+// The owner may designate one buyer without providing the buyer's x402 token.
+// Only a SHA-256 invite hash is persisted; never place buyer credentials in D1.
+async function issueTrialInvite(env){
+ if(env.CHECKOUT_ENABLED==='true')return fail('Public checkout must remain locked',409);
+ const id=await getSetting(env,'owner_first_live_test_order_id');
+ if(!id)return fail('Prepare the existing $1 order first',409);
+ const order=await q(env,'SELECT status,total_cents,currency FROM orders WHERE id=?',id).first();
+ const attempt=await q(env,'SELECT status,product_id FROM payment_attempts WHERE order_id=?',id).first();
+ if(!order||order.status!=='pending'||order.total_cents!==100||order.currency!=='USD'||attempt?.status!=='created'||attempt.product_id!=='package-1')return fail('The trial order is not eligible',409);
+ if(await getSetting(env,'owner_first_live_test_claimed'))return fail('Trial already claimed',409);
+ if(await getSetting(env,'buyer_trial_invite_hash'))return fail('A buyer invitation already exists. Do not issue another.',409);
+ const secret=token(32);
+ const result=await q(env,"INSERT OR IGNORE INTO settings(key,value) VALUES('buyer_trial_invite_hash',?)",await sha(secret)).run();
+ if(result.meta.changes!==1)return fail('A buyer invitation already exists',409);
+ return json({orderId:id,invite:secret,shareUrl:'/trial#invite='+encodeURIComponent(secret),priceCents:100,checkoutEnabled:false,chargeEnabled:false});
+}
+async function buyerTrialAccess(req,env){
+ const bearer=req.headers.get('Authorization')?.match(/^Bearer ([A-Za-z0-9_-]{20,100})$/)?.[1];
+ const stored=await getSetting(env,'buyer_trial_invite_hash');
+ if(!bearer||!stored||!equal(await sha(bearer),stored))return null;
+ return getSetting(env,'owner_first_live_test_order_id');
+}
+async function buyerTrialStatus(req,env){
+ const id=await buyerTrialAccess(req,env);if(!id)return fail('Invalid invitation',403);
+ const order=await q(env,'SELECT status,total_cents,currency FROM orders WHERE id=?',id).first();
+ const attempt=await q(env,'SELECT status,plan_id,credits_requested,error_code FROM payment_attempts WHERE order_id=?',id).first();
+ const delivered=await q(env,'SELECT COUNT(*) n FROM deliveries WHERE order_id=?',id).first();
+ return json({orderId:id,packageId:'package-1',priceCents:order?.total_cents,currency:order?.currency,orderStatus:order?.status,attemptStatus:attempt?.status,planId:attempt?.plan_id,redemptionUnits:attempt?.credits_requested,approved:env.OWNER_LIVE_TEST_APPROVED==='true',publicCheckoutEnabled:env.CHECKOUT_ENABLED==='true',claimed:Boolean(await getSetting(env,'owner_first_live_test_claimed')),deliveredKeys:Number(delivered?.n||0),errorCode:attempt?.error_code||null});
+}
+async function chargeBuyerTrial(req,env){
+ const id=await buyerTrialAccess(req,env);if(!id)return fail('Invalid invitation',403);
+ if(env.CHECKOUT_ENABLED==='true'||env.OWNER_LIVE_TEST_APPROVED!=='true')return fail('Owner approval required',403);
+ const order=await q(env,'SELECT status,total_cents,currency FROM orders WHERE id=?',id).first();
+ const attempt=await q(env,'SELECT status,product_id,credits_requested FROM payment_attempts WHERE order_id=?',id).first();
+ if(!order||order.status!=='pending'||order.total_cents!==100||order.currency!=='USD'||attempt?.status!=='created'||attempt.product_id!=='package-1'||Number(attempt.credits_requested)!==1)return fail('Trial is not eligible',409);
+ const d=await readJSON(req,10000);
+ if(d.confirm!=='CHARGE $1 '+id||typeof d.token!=='string'||d.token.length<8||d.token.length>8000)return fail('Explicit buyer confirmation and token required',400);
+ const claimed=await q(env,"INSERT OR IGNORE INTO settings(key,value) VALUES('owner_first_live_test_claimed',?)",id).run();
+ if(claimed.meta.changes!==1)return fail('This trial was already attempted. Do not retry.',409);
+ const headers=new Headers(req.headers);
+ headers.set('Authorization','Bearer '+await mac(env.SESSION_SECRET,'owner-first-live-test:'+id));
+ headers.set('Content-Type','application/json');
+ const internal=new Request(own(req)+'/api/orders/'+id+'/charge',{method:'POST',headers,body:JSON.stringify({token:d.token})});
+ return chargeOrder(internal,env,id,true);
+}
 async function chargeFirstOwnerTrial(req,env){
  if(env.CHECKOUT_ENABLED==='true'||env.OWNER_LIVE_TEST_APPROVED!=='true')return fail('Owner Live test is not authorized',403);
  const id=await getSetting(env,'owner_first_live_test_order_id');
@@ -278,6 +323,9 @@ export default {async fetch(req,env){
  try{
   if(!noCrossSite(req))return fail('Cross-origin requests are not permitted',403);
   if(req.method==='GET'&&path==='/')return page(storefront());
+  if(req.method==='GET'&&path==='/trial')return page(buyerTrialPage());
+  if(req.method==='GET'&&path==='/api/trial/status')return buyerTrialStatus(req,env);
+  if(req.method==='POST'&&path==='/api/trial/charge-once')return chargeBuyerTrial(req,env);
   if(req.method==='GET'&&path==='/api/health')return json({ok:true,checkoutEnabled:env.CHECKOUT_ENABLED==='true'});
 
 
@@ -298,6 +346,7 @@ export default {async fetch(req,env){
    if(req.method==='POST'&&path==='/api/admin/logout')return json({ok:true},200,{'Set-Cookie':cookie('',0)});
    if(req.method==='GET'&&path==='/api/admin/dashboard')return dashboard(env);
    if(req.method==='GET'&&path==='/api/admin/live-test/status')return ownerTrialStatus(env);
+   if(req.method==='POST'&&path==='/api/admin/live-test/invite')return issueTrialInvite(env);
    if(req.method==='POST'&&path==='/api/admin/live-test/recover')return recoverFirstOwnerTrial(env);
    if(req.method==='POST'&&path==='/api/admin/live-test/prepare')return prepareFirstOwnerTest(req,env);
    if(req.method==='POST'&&path==='/api/admin/live-test/verify-token')return verifyFirstOwnerToken(req,env);
