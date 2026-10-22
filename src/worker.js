@@ -328,8 +328,10 @@ async function chargeOrder(req,env,id,ownerTrial=false){
  if(!attempt||attempt.status!=='created')return fail('Order is already being processed or requires reconciliation. Never pay the same order twice.',409);
  if(!ownerTrial&&await checkoutHalted(env))return fail('Checkout temporarily suspended pending reconciliation',503);
  const d=await readJSON(req,10000);if(typeof d.token!=='string'||d.token.length>8000||d.token.length<8)return fail('Invalid token',402);
- const scope=decodeTokenScope(d.token);if(!scope||scope.planId!==attempt.plan_id)return fail('This token is not authorized for this package Payment Plan',402);
- const config=await paymentConfig(env);if(!config.agentId||scope.agentId&&scope.agentId!==config.agentId||scope.scheme!==config.scheme||scope.network!==config.network)return fail('Token Agent, payment scheme or network mismatch',402);
+ // Real Nevermined tokens are signed payload.authorization envelopes, not the synthetic accepted-plan format.
+ // Never trust client-decoded plan fields for authorization. The official facilitator
+ // verifies the token signature against server-built paymentRequired for THIS order's Plan.
+ const config=await paymentConfig(env);if(!config.agentId||config.scheme!=='nvm:card-delegation'||config.network!=='stripe')return fail('Payment configuration is invalid',503);
  const planPrice=await verifyPlanGrossPrice(env,config,attempt.plan_id,order.total_cents,Number(attempt.credits_requested));
  if(!planPrice.ok)return fail('Nevermined Plan price could not be verified; no charge attempted: '+planPrice.reason,503);
  if(!ownerTrial&&await startupDailyLimitReached(env))return fail('Initial launch daily settlement limit reached',429);
