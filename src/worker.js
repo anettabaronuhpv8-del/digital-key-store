@@ -73,6 +73,24 @@ async function changePassword(req,env){const d=await readJSON(req,5000);if(!awai
 async function orderSecret(req,env,id){const bearer=req.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];if(!bearer||bearer.length>300)return null;const order=await q(env,'SELECT * FROM orders WHERE id=?',id).first();return order&&equal(order.access_token_hash,await sha(bearer))?order:null;}
 // Admin-only preparation. Creates no charge, performs no verification/settlement,
 // and does not unlock the public checkout. One immutable pending trial at most.
+// Owner-only token verification for the existing unpaid $1 trial. No settlement.
+async function verifyFirstOwnerToken(req,env){
+ if(env.CHECKOUT_ENABLED==='true')return fail('Public checkout must remain locked',409);
+ const d=await readJSON(req,12000);
+ if(typeof d.token!=='string'||d.token.length<8||d.token.length>8000)return fail('Invalid token',400);
+ const id=await getSetting(env,'owner_first_live_test_order_id');
+ if(!id)return fail('Prepare the owner test order first',409);
+ const order=await q(env,'SELECT status,total_cents,currency FROM orders WHERE id=?',id).first();
+ const attempt=await q(env,'SELECT plan_id,credits_requested,status FROM payment_attempts WHERE order_id=?',id).first();
+ if(!order||order.status!=='pending'||order.total_cents!==100||order.currency!=='USD'||!attempt||attempt.status!=='created'||Number(attempt.credits_requested)!==1)return fail('Owner test order is no longer eligible',409);
+ const config=await paymentConfig(env);if(config.environment!=='live')return fail('Live configuration required',409);
+ const scope=decodeTokenScope(d.token);
+ if(!scope||scope.planId!==attempt.plan_id||scope.scheme!==config.scheme||scope.network!==config.network||scope.agentId&&scope.agentId!==config.agentId)return fail('Token does not match the $1 trial plan',402);
+ const requirement=buildPaymentRequiredForOrder({planId:attempt.plan_id,agentId:config.agentId,scheme:config.scheme,network:config.network,resourceUrl:own(req)+'/api/orders/'+id+'/charge'});
+ try{const client=createNevermined({NVM_API_KEY:await sellerKey(env),NVM_ENV:'live'});const response=await client.verify(d.token,requirement,1);
+  return json({orderId:id,tokenVersion:2,verified:isVerified(response),settled:false,charged:false,keyDelivered:false,agentRequestPresent:Boolean(response?.agentRequest?.agentRequestId),priceVerified:false});
+ }catch(err){return json({orderId:id,verified:false,settled:false,charged:false,keyDelivered:false,errorCode:safeError(err)},502);}
+}
 async function prepareFirstOwnerTest(req,env){
  if(env.CHECKOUT_ENABLED==='true')return fail('Owner test requires locked public checkout',409);
  const config=await paymentConfig(env);
@@ -235,6 +253,7 @@ export default {async fetch(req,env){
    if(req.method==='POST'&&path==='/api/admin/logout')return json({ok:true},200,{'Set-Cookie':cookie('',0)});
    if(req.method==='GET'&&path==='/api/admin/dashboard')return dashboard(env);
    if(req.method==='POST'&&path==='/api/admin/live-test/prepare')return prepareFirstOwnerTest(req,env);
+   if(req.method==='POST'&&path==='/api/admin/live-test/verify-token')return verifyFirstOwnerToken(req,env);
    if(req.method==='POST'&&path==='/api/admin/nevermined/verify')return json(await verifyNeverminedConnection(env));
    if(req.method==='PUT'&&path==='/api/admin/config')return saveConfig(req,env);if(req.method==='PUT'&&path==='/api/admin/password')return changePassword(req,env);
    if(req.method==='POST'&&path==='/api/admin/products')return createProduct(req,env);
