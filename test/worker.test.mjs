@@ -114,3 +114,20 @@ test('owner live $1 settlement is denied without separate approval and cannot ch
  assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
  assert.equal((await go(e,'/api/orders','POST',{productId:'package-1'})).status,503);
 });
+
+test('owner trial status and Live charge panel remain private and disabled without approval',async()=>{
+ const e=env();const cookie=await setup(e,{items:{'package-1':2}});
+ assert.equal((await go(e,'/api/admin/live-test/status')).status,403);
+ const response=await result(await go(e,'/api/admin/live-test/status','GET',undefined,undefined,cookie));
+ assert.equal(response.status,200);
+ assert.equal(response.body.approved,false);
+ assert.equal(response.body.checkoutEnabled,false);
+ assert.equal(response.body.paymentRecorded,undefined);
+ const html=await (await go(e,'/admin','GET',undefined,undefined,cookie)).text();
+ assert.match(html,/Authorize First Live \$1 Purchase/);
+ assert.match(html,/\/api\/admin\/live-test\/charge-once/);
+ assert.match(html,/\/api\/admin\/live-test\/status/);
+ assert.match(html,/owner-live-charge/);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM payments').get().n,0);
+ assert.equal(e.DB.db.prepare('SELECT count(*) n FROM deliveries').get().n,0);
+});
