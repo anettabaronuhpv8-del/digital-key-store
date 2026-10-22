@@ -27,6 +27,38 @@ async function createProduct(req,env){const d=await readJSON(req,5000);if(!produ
 async function updateProduct(req,env,id){const d=await readJSON(req,5000);if(!await q(env,'SELECT 1 FROM products WHERE id=? AND deleted_at IS NULL',id).first())return fail('Unknown product',404);if(typeof d.name!=='string'||!d.name.trim()||d.name.length>100||typeof d.description!=='string'||d.description.length>1000||!cents(d.priceCents)||typeof d.active!=='boolean'||typeof d.planEnabled!=='boolean'||!Number.isSafeInteger(d.credits)||d.credits<1||d.credits>10000000||typeof d.planId!=='string'||d.planId.length>256)return fail('Invalid product settings');if(d.planEnabled&&!d.planId.trim())return fail('Payment Plan ID required');await env.DB.batch([q(env,'UPDATE products SET name=?,description=?,price_cents=?,active=? WHERE id=?',d.name.trim(),d.description,d.priceCents,d.active?1:0,id),q(env,'INSERT INTO product_payment_plans(product_id,plan_id,credits_per_purchase,enabled) VALUES(?,?,?,?) ON CONFLICT(product_id) DO UPDATE SET plan_id=excluded.plan_id,credits_per_purchase=excluded.credits_per_purchase,enabled=excluded.enabled',id,d.planId.trim()||'not-configured',d.credits,d.planEnabled?1:0)]);await audit(env,'product_updated',id);return json({ok:true});}
 async function deleteProduct(env,id){await q(env,'UPDATE products SET active=0,deleted_at=CURRENT_TIMESTAMP WHERE id=? AND deleted_at IS NULL',id).run();await audit(env,'product_deleted',id);return json({ok:true});}
 async function saveConfig(req,env){const d=await readJSON(req,5000);if(typeof d.agentId!=='string'||d.agentId.length>300||!['sandbox','live'].includes(d.environment)||!['nvm:card-delegation','nvm:erc4337'].includes(d.scheme)||typeof d.network!=='string'||!['stripe','braintree','visa','eip155:84532','eip155:8453'].includes(d.network)||typeof d.sellerKey!=='string'||d.sellerKey.length>1500)return fail('Invalid payment settings');if((d.scheme==='nvm:card-delegation'&&!['stripe','braintree','visa'].includes(d.network))||(d.scheme==='nvm:erc4337'&&!d.network.startsWith('eip155:')))return fail('Scheme and network mismatch');if(d.sellerKey){if(!/^(nvm:|sandbox:|live:)/.test(d.sellerKey))return fail('Invalid Nevermined Seller API Key format');await setSetting(env,'seller_key_encrypted',await encrypt(await aes(env.CONFIG_SECRET),d.sellerKey));}await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','agent_id',d.agentId.trim()),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','environment',d.environment),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','scheme',d.scheme),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','network',d.network)]);await audit(env,'payment_config_updated');return json({ok:true});}
+// Read-only Nevermined connectivity diagnostics. Never returns bearer credentials or raw provider payloads.
+async function verifyNeverminedConnection(env,fetcher=fetch){
+ const config=await paymentConfig(env);
+ const key=await sellerKey(env);
+ if(!key||!config.agentId)return {ok:false,error:'Nevermined Seller API Key or Agent ID is not configured',plans:[]};
+ if(!['live','sandbox'].includes(config.environment))return {ok:false,error:'Invalid Nevermined environment',plans:[]};
+ const base='https://api.'+config.environment+'.nevermined.app/api/v1/protocol/';
+ async function read(path){
+  let response;
+  try{response=await fetcher(base+path,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},signal:AbortSignal.timeout(12000),redirect:'error'});}catch{return {ok:false,error:'CONNECTION_FAILED'};}
+  if(!response.ok)return {ok:false,error:response.status===401||response.status===403?'AUTH_REJECTED':'HTTP_'+response.status};
+  try{const body=await response.json();return {ok:true,body};}catch{return {ok:false,error:'INVALID_RESPONSE'};}
+ }
+ const agentResponse=await read('agents/'+encodeURIComponent(config.agentId));
+ const rows=await q(env,'SELECT p.id,p.price_cents,p.currency,pl.plan_id,pl.credits_per_purchase FROM products p LEFT JOIN product_payment_plans pl ON pl.product_id=p.id WHERE p.active=1 AND p.deleted_at IS NULL ORDER BY p.price_cents').all();
+ const associated=agentResponse.ok&&Array.isArray(agentResponse.body?.plans)?new Set(agentResponse.body.plans.map(p=>String(p.planId))):null;
+ const plans=[];
+ for(const p of rows.results){
+  if(!p.plan_id||p.plan_id==='not-configured'){plans.push({productId:p.id,ok:false,error:'PLAN_NOT_CONFIGURED'});continue;}
+  const r=await read('plans/'+encodeURIComponent(p.plan_id));
+  if(!r.ok){plans.push({productId:p.id,ok:false,error:r.error});continue;}
+  const b=r.body||{},price=b.priceConfig||{},credits=b.creditsConfig||{};
+  const linked=associated?associated.has(String(p.plan_id)):null;
+  // The public plan schema does not provide an authoritative fiat USD per-request price.
+  // Never infer a USD conversion from token amounts or the configured credit count.
+  const planIdMatches=String(b.planId)===String(p.plan_id);
+  const reportedCredits=Number.isSafeInteger(Number(credits.amount))?Number(credits.amount):null;
+  const creditsMatch=reportedCredits!==null&&reportedCredits===Number(p.credits_per_purchase);
+  plans.push({productId:p.id,ok:planIdMatches&&linked===true,planIdMatches,linkedToAgent:linked,expectedUsdCents:p.price_cents,currency:p.currency,creditsPerRequest:p.credits_per_purchase,planCreditAmount:reportedCredits,creditsMatch,priceType:typeof price.priceType==='string'?price.priceType:null,fiatUsdPriceVerified:false,networkVerified:false,schemeVerified:false,priceVerification:'UNVERIFIED_PROVIDER_METADATA'});
+ }
+ return {ok:agentResponse.ok&&plans.every(p=>p.ok),environment:config.environment,schemeConfigured:config.scheme,networkConfigured:config.network,agentReachable:agentResponse.ok,agentError:agentResponse.ok?null:agentResponse.error,plans,checkoutEnabled:env.CHECKOUT_ENABLED==='true',readOnly:true};
+}
 async function changePassword(req,env){const d=await readJSON(req,5000);if(!await passwordOK(env,d.currentPassword))return fail('Current password incorrect',403);if(typeof d.newPassword!=='string'||d.newPassword.length<20||d.newPassword.length>128)return fail('New password must be 20 to 128 characters',400);const changed=await mac(env.SESSION_SECRET,'admin-password:'+d.newPassword);const epoch=String(Number(await getSetting(env,'admin_session_epoch','1'))+1);await env.DB.batch([q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_password_digest',changed),q(env,'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value','admin_session_epoch',epoch)]);await audit(env,'admin_password_rotated');return json({ok:true},200,{'Set-Cookie':cookie('',0)});}
 async function orderSecret(req,env,id){const bearer=req.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];if(!bearer||bearer.length>300)return null;const order=await q(env,'SELECT * FROM orders WHERE id=?',id).first();return order&&equal(order.access_token_hash,await sha(bearer))?order:null;}
 async function startOrder(req,env){
@@ -134,6 +166,7 @@ export default {async fetch(req,env){
    if(!await isAdmin(req,env))return fail('Owner authentication required',403);
    if(req.method==='POST'&&path==='/api/admin/logout')return json({ok:true},200,{'Set-Cookie':cookie('',0)});
    if(req.method==='GET'&&path==='/api/admin/dashboard')return dashboard(env);
+   if(req.method==='POST'&&path==='/api/admin/nevermined/verify')return json(await verifyNeverminedConnection(env));
    if(req.method==='PUT'&&path==='/api/admin/config')return saveConfig(req,env);if(req.method==='PUT'&&path==='/api/admin/password')return changePassword(req,env);
    if(req.method==='POST'&&path==='/api/admin/products')return createProduct(req,env);
    const inv=idFrom(path,/^\/api\/admin\/products\/([a-z0-9-]{2,60})\/inventory$/);
