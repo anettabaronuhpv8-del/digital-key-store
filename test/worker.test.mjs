@@ -9,7 +9,27 @@ const keyToken=(plan,agent='agent-123')=>'x402_'+b64(new TextEncoder().encode(JS
 async function setup(e,{n=2,items={'package-1':2}}={}){const login=await result(await go(e,'/api/admin/login','POST',{password:e.ADMIN_BOOTSTRAP_PASSWORD}));assert.equal(login.status,200);const cookie=login.cookie.split(';')[0];for(const [pid,count] of Object.entries(items)){const txt=Array.from({length:count},(_,i)=>`SYNTHETIC-${pid}-${i}`).join('\n');assert.equal((await go(e,'/api/admin/products/'+pid+'/inventory','POST',{txt},null,cookie)).status,200);const price=Number(pid.replace('package-',''))*100;const p=await result(await go(e,'/api/admin/products/'+pid,'PUT',{name:'Package '+pid,description:'Synthetic',priceCents:price,active:true,planId:'plan-'+pid,credits:price,planEnabled:true},null,cookie));assert.equal(p.status,200);}assert.equal((await go(e,'/api/admin/config','PUT',{agentId:'agent-123',environment:'sandbox',scheme:'nvm:card-delegation',network:'stripe',sellerKey:'sandbox:seller-test'},null,cookie)).status,200);return cookie;}
 async function purchase(e,pid,tok=keyToken('plan-'+pid)){const a=await result(await go(e,'/api/orders','POST',{productId:pid}));if(a.status!==201)return a;const c=await result(await go(e,'/api/orders/'+a.body.orderId+'/charge','POST',{token:tok},a.body.deliveryToken));return {order:a.body,charge:c};}
 let tx=0;const savedFetch=globalThis.fetch;
-function mockFacilitator({verify=true,settle=true,delay=0,noReceipt=false,noAmount=false}={}){globalThis.fetch=async (url,opt)=>{if(delay)await new Promise(r=>setTimeout(r,delay));const body=JSON.parse(opt.body);if(url.endsWith('/verify'))return Response.json({isValid:verify,agentRequest:{agentRequestId:'request-mock-'+(++tx)}});if(url.endsWith('/settle')){if(settle==='timeout')throw Error('timeout');if(settle==='error')return Response.json({code:'BCK.X402.0049'},{status:400});if(!settle)return Response.json({success:false});const plan=body.paymentRequired?.accepts?.[0]?.planId||'plan-package-1';const cents=Number(plan.replace('plan-package-',''))*100;const id=noReceipt?'':`txPayg_${++tx}_${'x'.repeat(15)}`;return Response.json({success:true,billingModel:'pay-as-you-go',orderTx:id?{id,...(!noAmount?{amountCents:cents,currency:'USD'}:{})}:null});}throw Error('Unexpected URL: '+url);};}
+function mockPlanResponse(url){
+ const plan=decodeURIComponent(String(url).split('/plans/').pop());
+ const expectedCents=Number(plan.replace('plan-package-',''))*100;
+ const total=BigInt(expectedCents)*10000n;
+ return Response.json({id:plan,billingModel:'pay-as-you-go',metadata:{plan:{currency:'USD',fiatPaymentProvider:'stripe',x402Scheme:'nvm:card-delegation',priceId:'price_synthetic_test'}},registry:{price:{amounts:[String(total*98n/100n),String(total*2n/100n)]},credits:{amount:String(expectedCents)}}});
+}
+function mockFacilitator({verify=true,settle=true,delay=0,noReceipt=false}={}){
+ globalThis.fetch=async (url,opt)=>{
+  if(delay)await new Promise(r=>setTimeout(r,delay));
+  if(String(url).includes('/api/v1/protocol/plans/'))return mockPlanResponse(url);
+  const body=JSON.parse(opt.body);
+  if(url.endsWith('/verify'))return Response.json({isValid:verify,agentRequest:{agentRequestId:'request-mock-'+(++tx)}});
+  if(url.endsWith('/settle')){
+   if(settle==='timeout')throw Error('timeout');
+   if(settle==='error')return Response.json({code:'BCK.X402.0049'},{status:400});
+   if(!settle)return Response.json({success:false});
+   return Response.json({success:true,billingModel:'pay-as-you-go',network:'stripe',creditsRedeemed:'0',orderTx:noReceipt?'':'pi_'+(++tx)+'synthetic000001'});
+  }
+  throw Error('Unexpected URL: '+url);
+ };
+}
 const original={fetch:savedFetch};test.after(()=>{globalThis.fetch=original.fetch});
 test('customer storefront English and payment locked by default',async()=>{const e=env();const r=await go(e,'/');assert.equal(r.status,200);const text=await r.text();assert.match(text,/Buy 1 Key/);assert.match(text,/lang="en-US"/);assert.equal((await go(e,'/api/orders','POST',{productId:'package-1'})).status,503);});
 test('admin password, session and origin are enforced',async()=>{const e=env();assert.equal((await go(e,'/api/admin/dashboard')).status,403);assert.equal((await go(e,'/api/admin/login','POST',{password:'wrong'})).status,403);const cookie=await setup(e);assert.equal((await go(e,'/api/admin/dashboard','GET',undefined,undefined,cookie)).status,200);const cross=new Request('https://store.example/api/admin/config',{method:'PUT',headers:{Origin:'https://evil.example','Content-Type':'application/json',Cookie:cookie},body:'{}'});assert.equal((await worker.fetch(cross,e)).status,403);});
@@ -85,8 +105,9 @@ test('reused provider transaction receipt cannot deliver a second key',async()=>
  const e=env();await setup(e,{items:{'package-1':3}});e.CHECKOUT_ENABLED='true';
  const original=globalThis.fetch;let settleCount=0;
  globalThis.fetch=async(url,opt)=>{
+  if(String(url).includes('/api/v1/protocol/plans/'))return mockPlanResponse(url);
   if(url.endsWith('/verify'))return Response.json({isValid:true,agentRequest:{agentRequestId:'fresh-request-'+(++settleCount)}});
-  if(url.endsWith('/settle'))return Response.json({success:true,billingModel:'pay-as-you-go',orderTx:{id:'same_provider_transaction_123456',amountCents:100,currency:'USD'}});
+  if(url.endsWith('/settle'))return Response.json({success:true,billingModel:'pay-as-you-go',network:'stripe',orderTx:'pi_sameprovidertransaction123456'});
   throw Error('Unexpected URL');
  };
  try{
