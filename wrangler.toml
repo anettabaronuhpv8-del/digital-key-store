@@ -2,6 +2,7 @@ name = "digital-key-store"
 main = "src/worker.js"
 compatibility_date = "2026-10-01"
 workers_dev = true
+keep_vars = true
 
 [vars]
 CHECKOUT_ENABLED = "false"
