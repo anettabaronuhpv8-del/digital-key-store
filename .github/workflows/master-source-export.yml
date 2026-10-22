@@ -1,0 +1,23 @@
+name: Export Master Source Snapshot
+on:
+  push:
+    branches: [master-export-20261022]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Zip exact production source without .git
+        run: |
+          zip -q -r master-source.zip . -x '.git/*' '*node_modules/*' '.env*' '*.log'
+          unzip -t master-source.zip | tail -1
+          git rev-parse HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digital-key-store-source-export
+          path: master-source.zip
+          retention-days: 7
